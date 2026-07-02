@@ -763,7 +763,15 @@ ui <- dashboardPage(
   skin = "blue",
 
   dashboardHeader(
-    title = "ChromstaR Viewer",
+    title = tags$span(
+      tags$div("ChromstaR Viewer"),
+      tags$div(style = "font-size:11px; font-weight:normal; color:#dce6ec;", "by Janan Gawra")
+    ),
+    tags$li(
+      class = "dropdown",
+      style = "padding: 4px 15px;",
+      tags$img(src = "ihpe_logo.jpg", height = "42px")
+    ),
     tags$li(
       class = "dropdown",
       style = "padding: 8px 15px;",
@@ -783,6 +791,10 @@ ui <- dashboardPage(
       menuItem("Gene Set Comparison", tabName = "genesetcompare", icon = icon("dna")),
       menuItem("Data Table",      tabName = "table",      icon = icon("table")),
       menuItem("About / Help",    tabName = "about",      icon = icon("circle-info"))
+    ),
+    tags$div(
+      style = "position:absolute; bottom:0; width:100%; padding:10px 15px; color:#b8c7ce; font-size:11px; text-align:center;",
+      HTML("&copy; 2026 Janan Gawra &mdash; IHPE")
     )
   ),
 
@@ -797,6 +809,25 @@ ui <- dashboardPage(
         display: flex;
         flex-wrap: wrap;
       }
+      .skin-blue .main-header .logo {
+        height: 58px;
+        line-height: 1.1;
+        padding-top: 8px;
+        white-space: normal;
+        overflow: visible;
+      }
+      .skin-blue .main-header .navbar {
+        min-height: 58px;
+      }
+      .main-header { max-height: 58px; }
+      .main-header .navbar > .dropdown { display: flex; align-items: center; }
+      .main-sidebar, .left-side { top: 58px; }
+      .content-wrapper, .main-footer { margin-top: 58px; }
+
+      /* Keep the header fixed/visible while scrolling */
+      .main-header { position: fixed; width: 100%; top: 0; z-index: 1030; }
+      .main-header .navbar { position: relative; }
+      body { padding-top: 0; }
     "))),
 
     tabItems(
@@ -805,6 +836,15 @@ ui <- dashboardPage(
       # TAB 1 — LOAD DATA
       # -----------------------------------------------------------------------
       tabItem(tabName = "load",
+        fluidRow(
+          column(12,
+            tags$div(style = "text-align:center; padding: 10px 0 20px 0;",
+              tags$img(src = "ihpe_logo.jpg", height = "70px"),
+              tags$p(style = "color:#888; font-size:12px; margin-top:8px;",
+                HTML("&copy; 2026 Janan Gawra &mdash; IHPE (Institut des Sciences de l'Evolution, UMR 5244 CNRS-UPVD)"))
+            )
+          )
+        ),
         fluidRow(
           box(title = "Load ChromstaR Object (.RData)", width = 6, status = "primary",
             fileInput("chromstar_file", "Upload ChromstaR .RData file",
