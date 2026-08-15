@@ -40,20 +40,50 @@ library(GenomicFeatures)
 # HELPER FUNCTIONS
 # =============================================================================
 
-#' Load a ChromstaR combined multivariate model from .RData
+#' Load a ChromstaR combinedMultiHMM from .RData or .rds and immediately
+#' slim it to only the four slots the app actually queries, freeing the
+#' rest of RAM before returning. This keeps memory usage on shinyapps.io
+#' well within the 1 GB free-tier limit.
 load_chromstar_object <- function(path) {
-  env <- new.env()
-  load(path, envir = env)
-  objs <- ls(env)
-  # Return the first ChromstaR-related object found
-  for (nm in objs) {
-    obj <- get(nm, envir = env)
-    if (inherits(obj, c("combinedMultiHMM", "multiHMM", "uniHMM"))) {
-      return(obj)
+
+  ext <- tolower(tools::file_ext(path))
+
+  if (ext == "rds") {
+    obj <- readRDS(path)
+  } else {
+    env  <- new.env()
+    load(path, envir = env)
+    objs <- ls(env)
+    obj  <- NULL
+    for (nm in objs) {
+      candidate <- get(nm, envir = env)
+      if (inherits(candidate, c("combinedMultiHMM", "multiHMM", "uniHMM"))) {
+        obj <- candidate
+        break
+      }
     }
+    if (is.null(obj)) obj <- get(ls(env)[1], envir = env)
+    rm(env)
+    gc()
   }
-  # Fallback: return the first object
-  return(get(objs[1], envir = env))
+
+  # Slots the app needs:
+  #   bins     -> RPKM + posteriors + combinations (all analysis tabs)
+  #   segments -> merged chromatin segments (Differential Peaks tab)
+  #   info     -> mark / condition metadata (Load Data detection)
+  #   hmms     -> fallback for mark/condition detection on some object types
+  needed <- c("bins", "segments", "info", "hmms")
+  slim   <- list()
+  for (slot in needed) {
+    val <- tryCatch(obj[[slot]], error = function(e) NULL)
+    if (!is.null(val)) slim[[slot]] <- val
+  }
+  class(slim) <- class(obj)
+
+  rm(obj)
+  gc()
+
+  slim
 }
 
 #' Expand ChromstaR bins GRanges to a flat data.frame
@@ -846,13 +876,28 @@ ui <- dashboardPage(
           )
         ),
         fluidRow(
-          box(title = "Load ChromstaR Object (.RData)", width = 6, status = "primary",
-            fileInput("chromstar_file", "Upload ChromstaR .RData file",
-                      accept = c(".RData", ".rda", ".Rdata")),
+          box(title = "Load ChromstaR Object — Stage A (.RData / .rds)", width = 6, status = "primary",
+            textInput("stage_a_label", "Label for this dataset (used in plots)", value = "Stage A"),
+            fileInput("chromstar_file", "Upload ChromstaR .RData or .rds file",
+                      accept = c(".RData", ".rda", ".Rdata", ".rds")),
             verbatimTextOutput("chromstar_summary")
           ),
-          box(title = "Load Gene Annotation (TSV)", width = 6, status = "primary",
-            fileInput("gtf_file", 
+          box(title = "Load ChromstaR Object — Stage B (optional)", width = 6, status = "primary",
+            tags$small(style = "color:#888",
+              "Optional second object — e.g. a different developmental stage or physiological condition, loaded as an independent ChromstaR run. Once loaded, every analysis tab gains a “stages to compare” option so Stage A and Stage B can be viewed side by side."),
+            br(), br(),
+            textInput("stage_b_label", "Label for this dataset (used in plots)", value = "Stage B"),
+            fileInput("chromstar_file_b", "Upload ChromstaR .RData or .rds file",
+                      accept = c(".RData", ".rda", ".Rdata", ".rds")),
+            verbatimTextOutput("chromstar_summary_b")
+          )
+        ),
+        fluidRow(
+          box(title = "Load Gene Annotation (TSV)", width = 12, status = "primary",
+            tags$small(style = "color:#888",
+              "Shared across both stages — both ChromstaR objects are assumed to use the same genome/gene annotation."),
+            br(), br(),
+            fileInput("gtf_file",
                       label = "Upload genes.tsv file",
                       accept = c(".tsv", ".txt", ".csv", ".gtf")),
             tags$small(tags$em(
@@ -865,19 +910,41 @@ ui <- dashboardPage(
         fluidRow(
           box(title = "Detected Marks & Conditions", width = 12, status = "info",
             fluidRow(
-              column(4,
-                h4("Histone Marks"),
-                uiOutput("marks_ui")
-              ),
-              column(4,
-                h4("Conditions"),
+              column(3,
+                h4(textOutput("stage_a_label_header")),
+                h5("Histone Marks"),
+                uiOutput("marks_ui"),
+                h5("Conditions"),
                 uiOutput("conditions_ui")
               ),
-              column(4,
-                h4("Genome Info"),
+              column(3,
+                h4(textOutput("stage_b_label_header")),
+                h5("Histone Marks"),
+                uiOutput("marks_ui_b"),
+                h5("Conditions"),
+                uiOutput("conditions_ui_b")
+              ),
+              column(3,
+                h4("Genome Info — Stage A"),
                 verbatimTextOutput("genome_info")
+              ),
+              column(3,
+                h4("Genome Info — Stage B"),
+                verbatimTextOutput("genome_info_b")
               )
             )
+          )
+        ),
+        fluidRow(
+          box(title = "Condition / Life-cycle Order", width = 12, status = "warning",
+            tags$small(style = "color:#888",
+              HTML("Sets the order conditions appear in <b>every</b> plot legend, facet strip, and results table across the whole app. Drag the boxes below to arrange them into a biologically meaningful order — e.g. <b>TwoDO &rarr; Meta &rarr; PNA &rarr; PA</b> to follow the life cycle — instead of the default alphabetical order. Colours follow this order too, so the first condition always gets the first colour.")),
+            br(), br(),
+            uiOutput("condition_order_ui"),
+            actionButton("reset_condition_order", "Reset to detected order",
+                        class = "btn-sm btn-default"),
+            br(), br(),
+            uiOutput("condition_order_preview")
           )
         )
       ),
@@ -919,6 +986,9 @@ ui <- dashboardPage(
             hr(),
             h5("Marks to display"),
             uiOutput("mark_selector_meta"),
+            hr(),
+            h5("Stages to compare"),
+            uiOutput("stage_selector_meta"),
             hr(),
             h5("Display mode"),
             radioButtons("compare_mode_meta", "Condition comparison",
@@ -973,6 +1043,9 @@ ui <- dashboardPage(
             h5("Marks to display"),
             uiOutput("mark_selector_enr"),
             hr(),
+            h5("Stages to compare"),
+            uiOutput("stage_selector_enr"),
+            hr(),
             checkboxInput("smooth_enrichment", "Smooth curve (LOESS)", value = FALSE),
             actionButton("run_enrichment", "Compute Enrichment",
                          class = "btn-primary btn-block")
@@ -1023,6 +1096,9 @@ ui <- dashboardPage(
             h5("Marks to display"),
             uiOutput("mark_selector_browser"),
             hr(),
+            h5("Stages to compare"),
+            uiOutput("stage_selector_browser"),
+            hr(),
             h5("Display mode"),
             radioButtons("compare_mode_browser", "Condition comparison",
                          choices = c("Side-by-side" = "facet",
@@ -1044,6 +1120,10 @@ ui <- dashboardPage(
       tabItem(tabName = "table",
         fluidRow(
           box(title = "Chromatin State Segments", width = 12, status = "primary",
+            uiOutput("stage_selector_table"),
+            tags$small(style = "color:#888",
+              "When both stages are selected, rows from each are stacked with a \"stage\" column added — this table is not joined bin-for-bin across stages, since the two ChromstaR objects may not share identical binning."),
+            br(), br(),
             downloadButton("dl_full_table", "Download full table (CSV)",
                            class = "btn-success"),
             tags$small(style = "color:#888; margin-left:10px;",
@@ -1068,6 +1148,11 @@ ui <- dashboardPage(
             numericInput("diff_width_thresh", "Min merged region width (bp)",
                         value = 300, min = 0, step = 100),
             hr(),
+            h5("Stages to compare"),
+            uiOutput("stage_selector_diffpeaks"),
+            tags$small(style = "color:#888",
+              "Each stage has its own pair of conditions, so this runs the same filtering/counting pipeline independently per stage and shows them as separate panels."),
+            hr(),
             actionButton("run_diffpeaks", "Compute Differential Peaks",
                         class = "btn-primary btn-block")
           ),
@@ -1090,6 +1175,11 @@ ui <- dashboardPage(
             hr(),
             numericInput("gsc_upstream",   "Upstream of TSS (bp)",   value = 2000, min = 0, max = 20000, step = 100),
             numericInput("gsc_downstream", "Downstream of TSS (bp)", value = 2000, min = 0, max = 20000, step = 100),
+            hr(),
+            h5("Stages to compare"),
+            uiOutput("stage_selector_gsc"),
+            tags$small(style = "color:#888",
+              "Each stage is run independently through the same comparison (and, in permutation mode, its own random background), then combined into one results table/plot tagged by stage."),
             hr(),
             radioButtons("gsc_replicate_mode", "Replicates",
                         choices = c("Average across replicates" = "average",
@@ -1172,11 +1262,13 @@ ui <- dashboardPage(
 
               hr(),
               tags$h3("1. Load Data tab"),
-              tags$p(tags$b("Purpose:"), " upload your data. Nothing else works until this is done."),
+              tags$p(tags$b("Purpose:"), " upload your data. Nothing else works until Stage A is loaded."),
               tags$ul(
-                tags$li(tags$b("\"Upload ChromstaR .RData file\""), " (left box) — click to browse for your ChromstaR ", tags$code("combinedMultiHMM"), " object (a ", tags$code(".RData"), "/", tags$code(".rda"), " file). A text box below it shows a summary once loaded (object class, bin count, etc)."),
-                tags$li(tags$b("\"Upload genes.tsv file\""), " (right box) — click to browse for your gene annotation. This should be a simple table with columns ", tags$code("chr, start, end, gene_id, gene_name, strand"), " — convert a GTF to this format first if needed."),
-                tags$li(tags$b("Detected Marks & Conditions"), " panel at the bottom fills in automatically once both files are loaded — it lists every histone mark, every condition, and basic genome info found in your object. Use this to sanity-check the upload before moving to other tabs.")
+                tags$li(tags$b("\"Load ChromstaR Object — Stage A\""), " — click to browse for your ChromstaR ", tags$code("combinedMultiHMM"), " object. Accepts the original ", tags$code(".RData"), "/", tags$code(".rda"), " format or a pre-slimmed ", tags$code(".rds"), " file (recommended for faster loading). Give it a short label (e.g. \"Protoscolex\", \"Metacestode\") — this label appears throughout the app's plots and tables. A text box below shows a summary once loaded."),
+                tags$li(tags$b("\"Load ChromstaR Object — Stage B\""), " (optional) — load a second, independent ChromstaR object here to compare across developmental stages/conditions over time (e.g. protoscolex vs. metacestode, or dormant vs. activated). It does not need to share bin coordinates with Stage A — every comparison tab runs its own computation on each stage separately and combines the results, tagged by stage. Once loaded, every analysis tab gains a \"Stages to compare\" control."),
+                tags$li(tags$b("\"Upload genes.tsv file\""), " — click to browse for your gene annotation, shared by both stages. This should be a simple table with columns ", tags$code("chr, start, end, gene_id, gene_name, strand"), " — convert a GTF to this format first if needed."),
+                tags$li(tags$b("Detected Marks & Conditions"), " panel fills in automatically once each object is loaded — it lists every histone mark, every condition, and basic genome info found per stage. Use this to sanity-check the upload before moving to other tabs."),
+                tags$li(tags$b("\"Condition / Life-cycle Order\""), " box at the bottom — by default conditions are ordered alphabetically, which rarely matches the biology. Drag the condition boxes into the order you want (e.g. ", tags$code("TwoDO → Meta → PNA → PA"), " to follow the life cycle) and that order is applied everywhere in the app at once: legend order, facet strip order, the order of ", tags$code("rpkm_*"), " columns in the exported table, and which colour each condition gets. A coloured preview strip below the box shows the current order and its colours. \"Reset to detected order\" puts it back to how the objects were read in.")
               ),
 
               hr(),
@@ -1263,6 +1355,8 @@ ui <- dashboardPage(
               hr(),
               tags$h3("Key concepts that apply across several tabs"),
               tags$ul(
+                tags$li(tags$b("Condition / life-cycle order"), " — set once on the Load Data tab, applied globally. Conditions are drawn, coloured, faceted and exported in the order you drag them into, so a plot spanning both stages reads left-to-right along the life cycle rather than alphabetically. Any condition you don't explicitly place is appended at the end rather than dropped."),
+                tags$li(tags$b("Stages to compare"), " — appears on every analysis tab once a Stage B object is loaded. Each selected stage is run through the exact same computation independently (its own marks, its own conditions, its own bins), then the results are combined and labelled by stage — plots gain an extra facet row/column, and tables gain a \"stage\" column. Nothing requires the two ChromstaR objects to share identical binning."),
                 tags$li(tags$b("Gene scope"), " (Metagene/Enrichment tabs): \"only selected genes\" vs \"all genes in GTF.\" Both modes only ever include bins overlapping a gene — there's no \"intergenic\" position relative to a TSS or gene body."),
                 tags$li(tags$b("Bin/Chromosome scope"), " (Region Browser tab): whether to see every bin (including intergenic), only genic bins, or only intergenic bins; and whether to zoom into one chromosome or view several/all at full length."),
                 tags$li(tags$b("RPKM vs log(observed/expected)"), " — Metagene and Region Browser show raw mean RPKM signal. Enrichment Profile shows a log-ratio against the genome-wide average for that mark/condition, better for comparing marks with very different baseline signal levels."),
@@ -1309,13 +1403,19 @@ server <- function(input, output, session) {
     marks          = character(0),
     conditions     = character(0),
     chroms         = character(0),
-    bin_annotation = NULL   # cached gene context per bin
+    bin_annotation = NULL,   # cached gene context per bin (Stage A)
+
+    hmm_b            = NULL,
+    marks_b          = character(0),
+    conditions_b     = character(0),
+    chroms_b         = character(0),
+    bin_annotation_b = NULL  # cached gene context per bin (Stage B)
   )
 
-  # ---- Load ChromstaR object -------------------------------------------------
+  # ---- Load ChromstaR object — Stage A ---------------------------------------
   observeEvent(input$chromstar_file, {
     req(input$chromstar_file)
-    withProgress(message = "Loading ChromstaR object…", {
+    withProgress(message = "Loading ChromstaR object (Stage A)…", {
       tryCatch({
         hmm <- load_chromstar_object(input$chromstar_file$datapath)
         rv$hmm <- hmm
@@ -1347,10 +1447,217 @@ server <- function(input, output, session) {
           }
         })
       }, error = function(e) {
-        showNotification(paste("Error loading ChromstaR object:", e$message), type = "error")
+        showNotification(paste("Error loading ChromstaR object (Stage A):", e$message), type = "error")
       })
     })
   })
+
+  # ---- Load ChromstaR object — Stage B (optional) ----------------------------
+  observeEvent(input$chromstar_file_b, {
+    req(input$chromstar_file_b)
+    withProgress(message = "Loading ChromstaR object (Stage B)…", {
+      tryCatch({
+        hmm_b <- load_chromstar_object(input$chromstar_file_b$datapath)
+        rv$hmm_b <- hmm_b
+
+        parsed              <- parse_marks_conditions(hmm_b)
+        rv$marks_b          <- parsed$marks
+        rv$conditions_b     <- parsed$conditions
+        rv$chroms_b         <- as.character(unique(seqnames(hmm_b$bins)))
+        rv$bin_annotation_b <- NULL  # reset cache on new object
+
+        output$chromstar_summary_b <- renderPrint({
+          bins_df   <- expand_bins_df(hmm_b)
+          rpkm_cols <- grep("counts.rpkm", colnames(bins_df), value = TRUE)
+          cat("Object class:", class(hmm_b), "\n")
+          cat("Total bins:  ", length(hmm_b$bins), "\n")
+          cat("Chromosomes: ", paste(head(rv$chroms_b, 5), collapse = ", "), "…\n")
+          cat("Conditions:  ", paste(rv$conditions_b, collapse = ", "), "\n")
+          cat("Marks:       ", paste(rv$marks_b, collapse = ", "), "\n\n")
+          if (length(rpkm_cols) > 0) {
+            cat("counts.rpkm columns (", length(rpkm_cols), "):\n")
+            cat(" ", paste(head(rpkm_cols, 20), collapse = "\n  "), "\n")
+          } else {
+            cat("WARNING: No counts.rpkm.* columns found after expansion!\n")
+            cat("All mcols names: ", paste(head(colnames(bins_df), 30), collapse = ", "), "\n")
+          }
+          if (!is.null(hmm_b$info)) {
+            cat("\nhmm_b$info:\n")
+            print(hmm_b$info[, c("mark","condition","replicate"), drop = FALSE])
+          }
+        })
+      }, error = function(e) {
+        showNotification(paste("Error loading ChromstaR object (Stage B):", e$message), type = "error")
+      })
+    })
+  })
+
+  # ---- Stage labels (deduplicated so two stages never collide) --------------
+  `%||%` <- function(a, b) if (is.null(a)) b else a
+  stage_a_label <- reactive({
+    lbl <- trimws(input$stage_a_label %||% "")
+    if (!nzchar(lbl)) lbl <- "Stage A"
+    lbl
+  })
+  stage_b_label <- reactive({
+    lbl <- trimws(input$stage_b_label %||% "")
+    if (!nzchar(lbl)) lbl <- "Stage B"
+    if (!is.null(rv$hmm_b) && identical(lbl, stage_a_label())) lbl <- paste0(lbl, " (B)")
+    lbl
+  })
+
+  # ---- Unified view of whichever stage(s) are currently loaded ---------------
+  # Returns a named list keyed by the stage's display label, so downstream code
+  # (mark/stage selectors, per-stage compute loops, plot facets) can treat
+  # Stage A and Stage B uniformly and stay correct whether one or both are loaded.
+  active_stages <- reactive({
+    stages <- list()
+    if (!is.null(rv$hmm)) {
+      stages[[stage_a_label()]] <- list(
+        hmm = rv$hmm, marks = rv$marks, conditions = rv$conditions,
+        chroms = rv$chroms, key = "A"
+      )
+    }
+    if (!is.null(rv$hmm_b)) {
+      stages[[stage_b_label()]] <- list(
+        hmm = rv$hmm_b, marks = rv$marks_b, conditions = rv$conditions_b,
+        chroms = rv$chroms_b, key = "B"
+      )
+    }
+    stages
+  })
+
+  # Reusable "Stages to compare" checkbox UI — only rendered with a visible
+  # choice once Stage B is actually loaded; with only Stage A loaded it's
+  # skipped entirely and every compute path silently just uses Stage A.
+  stage_selector_ui <- function(input_id) {
+    stages <- names(active_stages())
+    if (length(stages) < 2) return(NULL)
+    checkboxGroupInput(input_id, NULL, choices = stages, selected = stages, inline = TRUE)
+  }
+
+  # Given a (possibly NULL/empty) selectize/checkbox input value, resolve it to
+  # the actual stage names to use — falls back to "all currently loaded stages"
+  # so tabs work fine before the user has touched the stage selector.
+  resolve_selected_stages <- function(input_val) {
+    stages <- names(active_stages())
+    if (is.null(input_val) || length(input_val) == 0) return(stages)
+    sel <- intersect(input_val, stages)
+    if (length(sel) == 0) stages else sel
+  }
+
+  # Run `compute_fn(stage_info)` once per selected stage, tag each non-NULL
+  # data.frame result with a "stage" column, and row-bind the results. This is
+  # the core mechanism that turns every single-object compute_* helper into a
+  # multi-stage one without having to touch those helpers themselves.
+  compute_across_stages <- function(selected_stage_names, compute_fn) {
+    stages  <- active_stages()
+    results <- list()
+    for (nm in selected_stage_names) {
+      st <- stages[[nm]]
+      if (is.null(st)) next
+      res <- compute_fn(st)
+      if (!is.null(res) && is.data.frame(res) && nrow(res) > 0) {
+        res$stage <- nm
+        results[[nm]] <- res
+      }
+    }
+    if (length(results) == 0) return(NULL)
+    out <- bind_rows(results)
+    # Stages keep load order (A then B) rather than alphabetical
+    out$stage <- factor(out$stage, levels = names(stages))
+    apply_condition_order(out)
+  }
+
+  # ---- Condition (life-cycle) ordering --------------------------------------
+  # Every condition found across both loaded objects, in raw detected order.
+  detected_conditions <- reactive({
+    unique(unlist(lapply(active_stages(), function(s) s$conditions)))
+  })
+
+  # The user's chosen display order. Anything they've arranged comes first, in
+  # their order; any condition they removed from the box (or that appeared only
+  # after they set the order) is appended at the end so nothing silently
+  # vanishes from a plot.
+  ordered_conditions <- reactive({
+    all_conds <- detected_conditions()
+    chosen    <- intersect(input$condition_order %||% character(0), all_conds)
+    c(chosen, setdiff(all_conds, chosen))
+  })
+
+  # Turn a data.frame's `condition` column into a factor with the user's chosen
+  # level order, so ggplot legends, facet strips and DT tables all follow the
+  # life cycle instead of sorting alphabetically.
+  apply_condition_order <- function(df) {
+    if (is.null(df) || !is.data.frame(df) || !"condition" %in% colnames(df)) return(df)
+    lv <- ordered_conditions()
+    lv <- c(intersect(lv, unique(as.character(df$condition))),
+            setdiff(unique(as.character(df$condition)), lv))
+    df$condition <- factor(as.character(df$condition), levels = lv)
+    df
+  }
+
+  output$condition_order_ui <- renderUI({
+    conds <- detected_conditions()
+    if (length(conds) == 0) {
+      return(tags$em(style = "color:#888", "Load a ChromstaR object to see its conditions here."))
+    }
+    selectizeInput(
+      "condition_order", NULL,
+      choices  = conds,
+      selected = ordered_conditions(),
+      multiple = TRUE,
+      width    = "100%",
+      options  = list(plugins = list("drag_drop", "remove_button"))
+    )
+  })
+
+  observeEvent(input$reset_condition_order, {
+    updateSelectizeInput(session, "condition_order",
+                        choices = detected_conditions(),
+                        selected = detected_conditions())
+  })
+
+  output$condition_order_preview <- renderUI({
+    conds <- ordered_conditions()
+    if (length(conds) == 0) return(NULL)
+    pal <- condition_palette()
+    chips <- lapply(seq_along(conds), function(i) {
+      tags$span(
+        style = paste0(
+          "display:inline-block; margin:2px 4px; padding:3px 10px; border-radius:12px;",
+          "background:", pal[[conds[i]]], "; color:white; font-weight:bold; font-size:12px;"
+        ),
+        paste0(i, ". ", conds[i])
+      )
+    })
+    tagList(
+      tags$small(style = "color:#555", "Current order (and the colour each condition will get):"),
+      br(),
+      tags$div(chips)
+    )
+  })
+
+  # A colour palette keyed by *condition name*, following the user's chosen
+  # life-cycle order, so a given condition (e.g. "PA") always gets the same
+  # colour whether it's plotted from Stage A alone or alongside Stage B.
+  base_palette <- c("#E63946", "#2196F3", "#FF9800", "#4CAF50",
+                    "#9C27B0", "#00BCD4", "#795548", "#607D8B")
+  condition_palette <- function() {
+    conds <- ordered_conditions()
+    setNames(base_palette[((seq_along(conds) - 1) %% length(base_palette)) + 1], conds)
+  }
+  # Union of marks across every loaded stage — used to build "Marks to
+  # display" checkboxes so a mark present in only one stage still shows up.
+  all_marks_reactive <- reactive({
+    unique(unlist(lapply(active_stages(), function(s) s$marks)))
+  })
+  all_chroms_reactive <- reactive({
+    unique(unlist(lapply(active_stages(), function(s) s$chroms)))
+  })
+
+  output$stage_a_label_header <- renderText(stage_a_label())
+  output$stage_b_label_header <- renderText(if (!is.null(rv$hmm_b)) stage_b_label() else "Stage B (not loaded)")
 
   # ---- Load Gene TSV ---------------------------------------------------------
   observeEvent(input$gtf_file, {
@@ -1414,6 +1721,18 @@ server <- function(input, output, session) {
     tags$ul(lapply(rv$conditions, tags$li))
   })
 
+  output$marks_ui_b <- renderUI({
+    if (is.null(rv$hmm_b)) return(tags$p(tags$em(style = "color:#888", "Not loaded.")))
+    req(length(rv$marks_b) > 0)
+    tags$ul(lapply(rv$marks_b, tags$li))
+  })
+
+  output$conditions_ui_b <- renderUI({
+    if (is.null(rv$hmm_b)) return(tags$p(tags$em(style = "color:#888", "Not loaded.")))
+    req(length(rv$conditions_b) > 0)
+    tags$ul(lapply(rv$conditions_b, tags$li))
+  })
+
   output$gtf_summary <- renderPrint({
     req(rv$genes)
     g       <- rv$genes
@@ -1433,21 +1752,39 @@ server <- function(input, output, session) {
     print(si)
   })
 
+  output$genome_info_b <- renderPrint({
+    if (is.null(rv$hmm_b)) {
+      cat("Not loaded.\n")
+      return(invisible(NULL))
+    }
+    si <- seqinfo(rv$hmm_b$bins)
+    print(si)
+  })
+
   # Mark selectors (each needs its own renderUI call — reusing one renderUI
   # result across two outputs does not work correctly in Shiny)
   output$mark_selector_meta <- renderUI({
-    req(length(rv$marks) > 0)
+    marks <- all_marks_reactive()
+    req(length(marks) > 0)
     checkboxGroupInput("marks_meta", NULL,
-                       choices  = rv$marks,
-                       selected = rv$marks)
+                       choices  = marks,
+                       selected = marks)
   })
 
   output$mark_selector_browser <- renderUI({
-    req(length(rv$marks) > 0)
+    marks <- all_marks_reactive()
+    req(length(marks) > 0)
     checkboxGroupInput("marks_browser", NULL,
-                       choices  = rv$marks,
-                       selected = rv$marks)
+                       choices  = marks,
+                       selected = marks)
   })
+
+  output$stage_selector_meta     <- renderUI(stage_selector_ui("stages_meta"))
+  output$stage_selector_enr      <- renderUI(stage_selector_ui("stages_enr"))
+  output$stage_selector_browser  <- renderUI(stage_selector_ui("stages_browser"))
+  output$stage_selector_diffpeaks <- renderUI(stage_selector_ui("stages_diffpeaks"))
+  output$stage_selector_gsc      <- renderUI(stage_selector_ui("stages_gsc"))
+  output$stage_selector_table    <- renderUI(stage_selector_ui("stages_table"))
 
   # Gene selectors
   gene_names_reactive <- reactive({
@@ -1545,10 +1882,11 @@ server <- function(input, output, session) {
 
   # ---- Enrichment tab: mark + gene selectors (mirrors metagene tab) ---------
   output$mark_selector_enr <- renderUI({
-    req(length(rv$marks) > 0)
+    marks <- all_marks_reactive()
+    req(length(marks) > 0)
     checkboxGroupInput("marks_enr", NULL,
-                       choices  = rv$marks,
-                       selected = rv$marks)
+                       choices  = marks,
+                       selected = marks)
   })
 
   output$gene_selector_enr <- renderUI({
@@ -1641,16 +1979,20 @@ server <- function(input, output, session) {
       )
     }
 
+    stage_names <- resolve_selected_stages(input$stages_enr)
+
     withProgress(message = paste0("Computing enrichment (", length(genes_sel), " genes)…"), {
-      compute_enrichment_profile(
-        hmm        = rv$hmm,
-        genes_gr   = genes_sel,
-        marks      = input$marks_enr,
-        conditions = rv$conditions,
-        upstream   = input$enr_upstream,
-        downstream = input$enr_downstream,
-        n_bins     = input$enr_n_bins
-      )
+      compute_across_stages(stage_names, function(st) {
+        compute_enrichment_profile(
+          hmm        = st$hmm,
+          genes_gr   = genes_sel,
+          marks      = input$marks_enr,
+          conditions = st$conditions,
+          upstream   = input$enr_upstream,
+          downstream = input$enr_downstream,
+          n_bins     = input$enr_n_bins
+        )
+      })
     })
   })
 
@@ -1672,10 +2014,12 @@ server <- function(input, output, session) {
       paste0("+", round(input$enr_downstream/2), "bp"), paste0("+", input$enr_downstream, "bp")
     )
 
-    conds <- rv$conditions
-    line_types <- setNames(rep(c("solid", "dotted", "dashed", "dotdash"),
+    # Keep the user's life-cycle order for the legend and line styles
+    conds       <- levels(droplevels(as.factor(df$condition)))
+    multi_stage <- length(unique(df$stage)) > 1
+    line_types  <- setNames(rep(c("solid", "dotted", "dashed", "dotdash"),
                                length.out = length(conds)), conds)
-    line_cols  <- setNames(c("#E63946", "#2196F3", "#FF9800", "#4CAF50")[seq_along(conds)], conds)
+    line_cols   <- condition_palette()
 
     # Shade the gene-body zone (x in [0,1]) so it's visually distinct from
     # the upstream/downstream flanks even before looking at axis labels
@@ -1700,15 +2044,27 @@ server <- function(input, output, session) {
       scale_x_continuous(breaks = x_breaks, labels = x_labels,
                          expand = expansion(mult = 0.02)) +
       scale_colour_manual(values = line_cols) +
-      scale_linetype_manual(values = line_types) +
-      facet_wrap(~ mark, scales = "free_y", ncol = 4) +
+      scale_linetype_manual(values = line_types)
+
+    if (multi_stage) {
+      p <- p + facet_grid(stage ~ mark, scales = "free_y")
+    } else {
+      p <- p + facet_wrap(~ mark, scales = "free_y", ncol = 4)
+    }
+
+    p <- p +
       labs(
         x = NULL,
         y = "log(observed/expected)",
         colour = "Condition", linetype = "Condition",
         title    = "Histone Mark Enrichment — Per Mark",
-        subtitle = paste0(paste(conds, collapse = " vs "),
-                          "  |  grey band = gene body, vertical lines = TSS and TES")
+        subtitle = if (multi_stage) {
+          paste0(paste(unique(df$stage), collapse = " vs "),
+                "  |  grey band = gene body, vertical lines = TSS and TES")
+        } else {
+          paste0(paste(conds, collapse = " vs "),
+                "  |  grey band = gene body, vertical lines = TSS and TES")
+        }
       ) +
       theme_bw(base_size = 13) +
       theme(
@@ -1761,20 +2117,21 @@ server <- function(input, output, session) {
   })
 
   output$chrom_selector <- renderUI({
-    req(length(rv$chroms) > 0)
+    chroms <- all_chroms_reactive()
+    req(length(chroms) > 0)
     if (identical(input$chrom_scope, "all")) {
       tags$small(style = "color:#888",
-        paste0("All ", length(rv$chroms), " chromosomes/contigs will be shown — this can be slow with hundreds of sequences."))
+        paste0("All ", length(chroms), " chromosomes/contigs (union across loaded stages) will be shown — this can be slow with hundreds of sequences."))
     } else if (identical(input$chrom_scope, "multi")) {
       selectizeInput("region_chrom", "Chromosomes (select one or more)",
-                     choices  = rv$chroms,
-                     selected = rv$chroms[1],
+                     choices  = chroms,
+                     selected = chroms[1],
                      multiple = TRUE,
-                     options  = list(maxOptions = length(rv$chroms) + 10))
+                     options  = list(maxOptions = length(chroms) + 10))
     } else {
       selectInput("region_chrom", "Chromosome",
-                  choices  = rv$chroms,
-                  selected = rv$chroms[1])
+                  choices  = chroms,
+                  selected = chroms[1])
     }
   })
 
@@ -1838,32 +2195,33 @@ server <- function(input, output, session) {
       )
     }
 
+    stage_names <- resolve_selected_stages(input$stages_meta)
+    modes_sel   <- input$metagene_mode
+    n_steps     <- max(1, length(modes_sel) * length(stage_names))
+
     withProgress(message = paste0("Computing metagene (", length(genes_sel), " genes)…"), {
-      modes_sel <- input$metagene_mode
-      n_modes   <- length(modes_sel)
-      results   <- list()
-
-      for (i in seq_along(modes_sel)) {
-        m <- modes_sel[i]
-        incProgress(1 / n_modes, detail = paste0("Reference: ", m))
-        res <- compute_metagene(
-          hmm        = rv$hmm,
-          genes_gr   = genes_sel,
-          marks      = input$marks_meta,
-          conditions = rv$conditions,
-          mode       = m,
-          upstream   = input$upstream,
-          downstream = input$downstream,
-          n_bins     = input$n_bins
-        )
-        if (!is.null(res) && nrow(res) > 0) {
-          res$ref_type <- m
-          results[[m]] <- res
+      compute_across_stages(stage_names, function(st) {
+        results <- list()
+        for (m in modes_sel) {
+          incProgress(1 / n_steps, detail = paste0("Reference: ", m))
+          res <- compute_metagene(
+            hmm        = st$hmm,
+            genes_gr   = genes_sel,
+            marks      = input$marks_meta,
+            conditions = st$conditions,
+            mode       = m,
+            upstream   = input$upstream,
+            downstream = input$downstream,
+            n_bins     = input$n_bins
+          )
+          if (!is.null(res) && nrow(res) > 0) {
+            res$ref_type <- m
+            results[[m]] <- res
+          }
         }
-      }
-
-      if (length(results) == 0) return(NULL)
-      bind_rows(results)
+        if (length(results) == 0) return(NULL)
+        bind_rows(results)
+      })
     })
   })
 
@@ -1871,9 +2229,10 @@ server <- function(input, output, session) {
     df <- metagene_data()
     req(df)
 
-    n_bins  <- input$n_bins
-    modes_sel <- unique(df$ref_type)
-    multi_ref <- length(modes_sel) > 1
+    n_bins      <- input$n_bins
+    modes_sel   <- unique(df$ref_type)
+    multi_ref   <- length(modes_sel) > 1
+    multi_stage <- length(unique(df$stage)) > 1
 
     x_breaks <- c(1, round(n_bins / 2), n_bins)
 
@@ -1899,6 +2258,15 @@ server <- function(input, output, session) {
       p <- p + geom_line(linewidth = 0.7)
     }
 
+    # Build the column-facet dimensions dynamically: ref_type (when more than
+    # one reference is selected), stage (when Stage B is included in the
+    # comparison), and condition (only in "Side-by-side" mode — "Overlay"
+    # keeps condition as colour instead of a facet column).
+    col_terms <- character(0)
+    if (multi_ref)                          col_terms <- c(col_terms, "ref_type")
+    if (multi_stage)                        col_terms <- c(col_terms, "stage")
+    if (input$compare_mode_meta == "facet") col_terms <- c(col_terms, "condition")
+
     if (multi_ref) {
       # When multiple reference modes are shown together, x-axis meaning differs
       # per column (TSS/TES = bp distance, gene_body = %), so we can't use one
@@ -1907,29 +2275,28 @@ server <- function(input, output, session) {
       # using a single consistent breaks/labels set that's "close enough"
       # (Start/Mid/End) across all reference types for visual alignment.
       p <- p + scale_x_continuous(breaks = x_breaks, labels = c("Start", "Mid", "End"))
-      facet_formula <- if (input$compare_mode_meta == "facet") {
-        mark ~ ref_type + condition
-      } else {
-        mark ~ ref_type
-      }
-      p <- p + facet_grid(facet_formula, scales = "free_y")
       title_txt <- paste("Metagene profile —", paste(modes_sel, collapse = " / "))
     } else {
       x_labels <- label_for_mode(modes_sel[1])
       p <- p + scale_x_continuous(breaks = x_breaks, labels = x_labels)
-      if (input$compare_mode_meta == "facet") {
-        p <- p + facet_grid(mark ~ condition, scales = "free_y")
-      } else {
-        p <- p + facet_wrap(~ mark, scales = "free_y", ncol = 2)
-      }
       title_txt <- paste("Metagene profile —", modes_sel[1])
     }
 
+    if (length(col_terms) == 0) {
+      p <- p + facet_wrap(~ mark, scales = "free_y", ncol = 2)
+    } else {
+      facet_formula <- as.formula(paste("mark ~", paste(col_terms, collapse = " + ")))
+      p <- p + facet_grid(facet_formula, scales = "free_y")
+    }
+
+    if (multi_stage) {
+      title_txt <- paste0(title_txt, "  |  ", paste(unique(df$stage), collapse = " vs "))
+    }
+
+    pal <- condition_palette()
     p <- p +
-      scale_colour_manual(values = c("#E63946", "#2196F3",
-                                     "#FF9800", "#4CAF50")[seq_along(rv$conditions)]) +
-      scale_fill_manual(values   = c("#E63946", "#2196F3",
-                                     "#FF9800", "#4CAF50")[seq_along(rv$conditions)]) +
+      scale_colour_manual(values = pal) +
+      scale_fill_manual(values   = pal) +
       labs(x = NULL, y = "Mean RPKM (averaged across replicates)",
            colour = "Condition", fill = "Condition",
            title = title_txt,
@@ -1971,7 +2338,7 @@ server <- function(input, output, session) {
 
     marks_use <- input$marks_browser
     if (is.null(marks_use) || length(marks_use) == 0) {
-      marks_use <- rv$marks  # fallback: use all marks if checkboxes haven't registered
+      marks_use <- all_marks_reactive()  # fallback: use all marks if checkboxes haven't registered
       if (length(marks_use) == 0) {
         showNotification("No histone marks available — load a ChromstaR object first.",
                          type = "error", duration = 6)
@@ -1979,28 +2346,14 @@ server <- function(input, output, session) {
       }
     }
 
-    seqinfo_obj <- seqinfo(rv$hmm$bins)
-
     if (identical(input$chrom_scope, "all")) {
-      chroms_use <- rv$chroms
+      chroms_use <- all_chroms_reactive()
     } else if (identical(input$chrom_scope, "multi")) {
       req(input$region_chrom)
       chroms_use <- input$region_chrom
     } else {
       req(input$region_chrom, input$region_start, input$region_end)
       chroms_use <- input$region_chrom
-    }
-
-    if (identical(input$chrom_scope, "single")) {
-      region_gr <- GRanges(seqnames = chroms_use,
-                           ranges   = IRanges(start = input$region_start,
-                                              end   = input$region_end))
-    } else {
-      # Full length of each selected chromosome
-      lens <- seqlengths(seqinfo_obj)[chroms_use]
-      lens[is.na(lens)] <- 1e9  # fallback if seqlengths missing
-      region_gr <- GRanges(seqnames = chroms_use,
-                           ranges   = IRanges(start = 1, end = lens))
     }
 
     scope <- input$bin_scope_browser
@@ -2019,15 +2372,32 @@ server <- function(input, output, session) {
       )
     }
 
+    stage_names <- resolve_selected_stages(input$stages_browser)
+
     withProgress(message = paste0("Extracting signal (", length(chroms_use), " chromosome(s))…"), {
-      extract_signal_region(
-        hmm        = rv$hmm,
-        region_gr  = region_gr,
-        marks      = marks_use,
-        conditions = rv$conditions,
-        genes_gr   = rv$genes,
-        bin_scope  = scope
-      )
+      compute_across_stages(stage_names, function(st) {
+        if (identical(input$chrom_scope, "single")) {
+          region_gr <- GRanges(seqnames = chroms_use,
+                               ranges   = IRanges(start = input$region_start,
+                                                  end   = input$region_end))
+        } else {
+          # Full length of each selected chromosome, per this stage's own seqinfo
+          # (the two stages' ChromstaR objects need not share identical seqlengths)
+          lens <- seqlengths(seqinfo(st$hmm$bins))[chroms_use]
+          lens[is.na(lens)] <- 1e9  # fallback if seqlengths missing / chrom absent here
+          region_gr <- GRanges(seqnames = chroms_use,
+                               ranges   = IRanges(start = 1, end = lens))
+        }
+
+        extract_signal_region(
+          hmm        = st$hmm,
+          region_gr  = region_gr,
+          marks      = marks_use,
+          conditions = st$conditions,
+          genes_gr   = rv$genes,
+          bin_scope  = scope
+        )
+      })
     })
   })
 
@@ -2037,6 +2407,7 @@ server <- function(input, output, session) {
 
     n_chroms_shown <- length(unique(df$chr))
     multi_chrom    <- n_chroms_shown > 1
+    multi_stage    <- length(unique(df$stage)) > 1
 
     # Gene annotation track (optional overlay) — only meaningful in single-chrom mode,
     # since position scales differ across chromosomes
@@ -2060,15 +2431,14 @@ server <- function(input, output, session) {
       }
     }
 
+    pal <- condition_palette()
     p <- ggplot(df, aes(x = position, y = signal,
                         colour = condition, fill = condition)) +
       geom_area(alpha = 0.35, position = "identity") +
       geom_line(linewidth = 0.7) +
       scale_x_continuous(labels = label_comma()) +
-      scale_colour_manual(values = c("#E63946", "#2196F3",
-                                     "#FF9800", "#4CAF50")[seq_along(rv$conditions)]) +
-      scale_fill_manual(values   = c("#E63946", "#2196F3",
-                                     "#FF9800", "#4CAF50")[seq_along(rv$conditions)]) +
+      scale_colour_manual(values = pal) +
+      scale_fill_manual(values   = pal) +
       theme_bw(base_size = 12) +
       theme(
         strip.background = element_rect(fill = "#2c3e50"),
@@ -2082,12 +2452,17 @@ server <- function(input, output, session) {
         labs(x = "Position (bp, per chromosome)",
              y = "RPKM (averaged across replicates)",
              colour = "Condition", fill = "Condition",
-             title  = paste0(n_chroms_shown, " chromosomes — ", input$bin_scope_browser, " bins"))
-      # Facet by chromosome AND mark; condition stays as colour
+             title  = paste0(n_chroms_shown, " chromosomes — ", input$bin_scope_browser, " bins",
+                             if (multi_stage) paste0("  |  ", paste(unique(df$stage), collapse = " vs ")) else ""))
+      # Facet by chromosome AND mark (and stage, if two stages are shown);
+      # condition stays as colour
+      row_terms <- c("mark", if (multi_stage) "stage")
       if (input$compare_mode_browser == "facet") {
-        p <- p + facet_grid(mark ~ chr, scales = "free")
+        facet_formula <- as.formula(paste(paste(row_terms, collapse = " + "), "~ chr"))
+        p <- p + facet_grid(facet_formula, scales = "free")
       } else {
-        p <- p + facet_wrap(chr ~ mark, scales = "free", ncol = length(unique(df$mark)))
+        wrap_formula <- as.formula(paste("chr", if (multi_stage) "+ stage" else "", "~ mark"))
+        p <- p + facet_wrap(wrap_formula, scales = "free", ncol = length(unique(df$mark)))
       }
     } else {
       p <- p +
@@ -2097,14 +2472,19 @@ server <- function(input, output, session) {
              title  = if (identical(input$chrom_scope, "single")) {
                paste0(input$region_chrom, ":",
                      format(input$region_start, big.mark = ","), "–",
-                     format(input$region_end,   big.mark = ","))
+                     format(input$region_end,   big.mark = ","),
+                     if (multi_stage) paste0("  |  ", paste(unique(df$stage), collapse = " vs ")) else "")
              } else {
                paste0(unique(df$chr)[1], " (full length)")
              })
-      if (input$compare_mode_browser == "facet") {
-        p <- p + facet_grid(mark ~ condition, scales = "free_y")
-      } else {
+      col_terms <- character(0)
+      if (multi_stage)                            col_terms <- c(col_terms, "stage")
+      if (input$compare_mode_browser == "facet")   col_terms <- c(col_terms, "condition")
+      if (length(col_terms) == 0) {
         p <- p + facet_wrap(~ mark, scales = "free_y", ncol = 2)
+      } else {
+        facet_formula <- as.formula(paste("mark ~", paste(col_terms, collapse = " + ")))
+        p <- p + facet_grid(facet_formula, scales = "free_y")
       }
 
       # Add gene annotation track only for single-chromosome zoomed view
@@ -2135,121 +2515,124 @@ server <- function(input, output, session) {
   )
 
   # ---- DATA TABLE ------------------------------------------------------------
-  # Gene annotation is computed once and cached in rv$bin_annotation
+  # Bin -> gene/zone annotation, extracted as a reusable function so it can be
+  # cached once per stage instead of just once globally.
+  annotate_bins <- function(bins, genes) {
+    g_names <- mcols(genes)$gene_name
+    s_g     <- start(genes)
+    e_g     <- end(genes)
+    str_g   <- as.character(strand(genes))
+    glen    <- e_g - s_g
+
+    tss <- ifelse(str_g == "-", e_g, s_g)
+    tes <- ifelse(str_g == "-", s_g, e_g)
+    chr_g <- as.character(seqnames(genes))
+
+    make_zone_gr <- function(starts, ends, names_vec, chr_vec) {
+      ok <- starts >= 1 & ends >= 1 & starts <= ends
+      GRanges(
+        seqnames  = chr_vec[ok],
+        ranges    = IRanges(pmax(1L, starts[ok]), pmax(1L, ends[ok])),
+        gene_name = names_vec[ok],
+        zone_idx  = which(ok)
+      )
+    }
+
+    zone_list <- list(
+      TSS_pm200          = make_zone_gr(tss - 200,        tss + 200,        g_names, chr_g),
+      gene_body_5prime   = make_zone_gr(s_g,              s_g + floor(glen/3),      g_names, chr_g),
+      gene_body_middle   = make_zone_gr(s_g + floor(glen/3)+1, s_g + floor(2*glen/3), g_names, chr_g),
+      gene_body_3prime   = make_zone_gr(s_g + floor(2*glen/3)+1, e_g,               g_names, chr_g),
+      upstream_1000_0    = make_zone_gr(tss - 1000,       tss - 1,          g_names, chr_g),
+      upstream_2000_1000 = make_zone_gr(tss - 2000,       tss - 1001,       g_names, chr_g),
+      TES_0_1000         = make_zone_gr(tes + 1,          tes + 1000,       g_names, chr_g),
+      TES_1000_2000      = make_zone_gr(tes + 1001,       tes + 2000,       g_names, chr_g)
+    )
+
+    zone_priority <- c(
+      TSS_pm200 = 1L, gene_body_5prime = 2L, gene_body_middle = 3L,
+      gene_body_3prime = 4L, upstream_1000_0 = 5L, upstream_2000_1000 = 6L,
+      TES_0_1000 = 7L, TES_1000_2000 = 8L
+    )
+
+    n_bins    <- length(bins)
+    best_pri  <- rep(9L,              n_bins)
+    best_gene <- rep(NA_character_,   n_bins)
+    best_zone <- rep("Intergenic",    n_bins)
+
+    for (zname in names(zone_list)) {
+      zr  <- zone_list[[zname]]
+      if (length(zr) == 0) next
+      ov  <- findOverlaps(bins, zr, ignore.strand = TRUE)
+      bi  <- queryHits(ov)
+      pri <- zone_priority[zname]
+      upd <- bi[best_pri[bi] > pri]
+      if (length(upd) == 0) next
+      zi  <- subjectHits(ov)[best_pri[bi] > pri]
+      best_pri[upd]  <- pri
+      best_gene[upd] <- mcols(zr)$gene_name[zi]
+      best_zone[upd] <- zname
+    }
+
+    zone_labels <- c(
+      TSS_pm200          = "TSS ±200bp",
+      gene_body_5prime   = "Gene body 5′ (1/3)",
+      gene_body_middle   = "Gene body middle (2/3)",
+      gene_body_3prime   = "Gene body 3′ (3/3)",
+      upstream_1000_0    = "Upstream 1000–0bp",
+      upstream_2000_1000 = "Upstream 2000–1000bp",
+      TES_0_1000         = "TES 0–1000bp",
+      TES_1000_2000      = "TES 1000–2000bp",
+      Intergenic         = "Intergenic"
+    )
+
+    data.frame(
+      gene_name    = best_gene,
+      genomic_zone = zone_labels[best_zone],
+      stringsAsFactors = FALSE
+    )
+  }
+
+  # Gene annotation is computed once per stage and cached
   observe({
     req(rv$hmm, rv$genes)
-    if (!is.null(rv$bin_annotation)) return()  # already computed
-
-    withProgress(message = "Annotating bins (one-time, ~5 sec)…", {
-
-      genes   <- rv$genes
-      g_names <- mcols(genes)$gene_name
-      s_g     <- start(genes)
-      e_g     <- end(genes)
-      str_g   <- as.character(strand(genes))
-      glen    <- e_g - s_g
-
-      # TSS / TES vectorised
-      tss <- ifelse(str_g == "-", e_g, s_g)
-      tes <- ifelse(str_g == "-", s_g, e_g)
-
-      chr_g <- as.character(seqnames(genes))
-
-      # Helper: build a GRanges for all genes at once, clip negatives
-      make_zone_gr <- function(starts, ends, names_vec, chr_vec) {
-        ok <- starts >= 1 & ends >= 1 & starts <= ends
-        GRanges(
-          seqnames  = chr_vec[ok],
-          ranges    = IRanges(pmax(1L, starts[ok]), pmax(1L, ends[ok])),
-          gene_name = names_vec[ok],
-          zone_idx  = which(ok)    # index back to original gene row
-        )
-      }
-
-      # Build all 8 zone GRanges in one shot (vectorised over all genes)
-      zone_list <- list(
-        TSS_pm200          = make_zone_gr(tss - 200,        tss + 200,        g_names, chr_g),
-        gene_body_5prime   = make_zone_gr(s_g,              s_g + floor(glen/3),      g_names, chr_g),
-        gene_body_middle   = make_zone_gr(s_g + floor(glen/3)+1, s_g + floor(2*glen/3), g_names, chr_g),
-        gene_body_3prime   = make_zone_gr(s_g + floor(2*glen/3)+1, e_g,               g_names, chr_g),
-        upstream_1000_0    = make_zone_gr(tss - 1000,       tss - 1,          g_names, chr_g),
-        upstream_2000_1000 = make_zone_gr(tss - 2000,       tss - 1001,       g_names, chr_g),
-        TES_0_1000         = make_zone_gr(tes + 1,          tes + 1000,       g_names, chr_g),
-        TES_1000_2000      = make_zone_gr(tes + 1001,       tes + 2000,       g_names, chr_g)
-      )
-
-      # Priority (lower = higher priority)
-      zone_priority <- c(
-        TSS_pm200 = 1L, gene_body_5prime = 2L, gene_body_middle = 3L,
-        gene_body_3prime = 4L, upstream_1000_0 = 5L, upstream_2000_1000 = 6L,
-        TES_0_1000 = 7L, TES_1000_2000 = 8L
-      )
-
-      bins    <- rv$hmm$bins
-      n_bins  <- length(bins)
-      best_pri   <- rep(9L,              n_bins)
-      best_gene  <- rep(NA_character_,   n_bins)
-      best_zone  <- rep("Intergenic",    n_bins)
-
-      # 8 findOverlaps calls total — fast
-      for (zname in names(zone_list)) {
-        zr  <- zone_list[[zname]]
-        if (length(zr) == 0) next
-        ov  <- findOverlaps(bins, zr, ignore.strand = TRUE)
-        bi  <- queryHits(ov)
-        pri <- zone_priority[zname]
-        upd <- bi[best_pri[bi] > pri]
-        if (length(upd) == 0) next
-        zi  <- subjectHits(ov)[best_pri[bi] > pri]
-        best_pri[upd]  <- pri
-        best_gene[upd] <- mcols(zr)$gene_name[zi]
-        best_zone[upd] <- zname
-      }
-
-      zone_labels <- c(
-        TSS_pm200          = "TSS ±200bp",
-        gene_body_5prime   = "Gene body 5′ (1/3)",
-        gene_body_middle   = "Gene body middle (2/3)",
-        gene_body_3prime   = "Gene body 3′ (3/3)",
-        upstream_1000_0    = "Upstream 1000–0bp",
-        upstream_2000_1000 = "Upstream 2000–1000bp",
-        TES_0_1000         = "TES 0–1000bp",
-        TES_1000_2000      = "TES 1000–2000bp",
-        Intergenic         = "Intergenic"
-      )
-
-      rv$bin_annotation <- data.frame(
-        gene_name   = best_gene,
-        genomic_zone = zone_labels[best_zone],
-        stringsAsFactors = FALSE
-      )
+    if (!is.null(rv$bin_annotation)) return()
+    withProgress(message = "Annotating bins for Stage A (one-time, ~5 sec)…", {
+      rv$bin_annotation <- annotate_bins(rv$hmm$bins, rv$genes)
     })
   })
 
-  full_table_df <- reactive({
-    req(rv$hmm, rv$bin_annotation)
+  observe({
+    req(rv$hmm_b, rv$genes)
+    if (!is.null(rv$bin_annotation_b)) return()
+    withProgress(message = "Annotating bins for Stage B (one-time, ~5 sec)…", {
+      rv$bin_annotation_b <- annotate_bins(rv$hmm_b$bins, rv$genes)
+    })
+  })
 
-    bins_df <- expand_bins_df(rv$hmm)
+  # Build the per-bin state table for one stage
+  build_stage_table <- function(hmm, bin_annotation, marks, conditions) {
+    bins_df <- expand_bins_df(hmm)
     state_cols <- intersect(
       c("chr", "start", "end", "transition.group", "state",
-        "combination.PA", "combination.PNA",
+        grep("^combination\\.", colnames(bins_df), value = TRUE),
         "differential.score", "maxPostInPeak"),
       colnames(bins_df)
     )
 
     df <- cbind(
       bins_df[, state_cols, drop = FALSE],
-      rv$bin_annotation
+      bin_annotation
     )
     df$width  <- df$end - df$start + 1
     df$bin_id <- paste0(df$chr, ":", df$start, "-", df$end)
 
-    # Add mean RPKM per mark/condition (averaged across replicates) so the
-    # exported table includes the actual quantitative signal, not just
-    # categorical state/combination columns
     rpkm_cols_all <- grep("counts.rpkm", colnames(bins_df), value = TRUE, fixed = TRUE)
-    for (cond in rv$conditions) {
-      for (mark in rv$marks) {
+    # Emit the rpkm_<mark>_<condition> columns in the user's life-cycle order
+    conditions <- c(intersect(ordered_conditions(), conditions),
+                    setdiff(conditions, ordered_conditions()))
+    for (cond in conditions) {
+      for (mark in marks) {
         pattern <- paste0("counts.rpkm.", mark, ".", cond)
         cols    <- grep(pattern, rpkm_cols_all, value = TRUE, fixed = TRUE)
         if (length(cols) == 0) next
@@ -2257,9 +2640,29 @@ server <- function(input, output, session) {
         df[[colname]] <- round(rowMeans(bins_df[, cols, drop = FALSE], na.rm = TRUE), 4)
       }
     }
+    df
+  }
 
-    # Move gene/identifier cols to front
-    front <- c("bin_id", "chr", "start", "end", "width", "gene_name", "genomic_zone")
+  full_table_df <- reactive({
+    req(rv$hmm, rv$bin_annotation)
+
+    stage_names <- resolve_selected_stages(input$stages_table)
+    stages      <- active_stages()
+    annots      <- list(); annots[[stage_a_label()]] <- rv$bin_annotation
+    if (!is.null(rv$hmm_b)) annots[[stage_b_label()]] <- rv$bin_annotation_b
+
+    tables <- list()
+    for (nm in stage_names) {
+      st <- stages[[nm]]
+      if (is.null(st) || is.null(annots[[nm]])) next
+      tdf <- build_stage_table(st$hmm, annots[[nm]], st$marks, st$conditions)
+      if (!is.null(rv$hmm_b)) tdf$stage <- nm  # only add the column when a 2nd object is loaded at all
+      tables[[nm]] <- tdf
+    }
+    if (length(tables) == 0) return(NULL)
+    df <- bind_rows(tables)
+
+    front <- c("stage", "bin_id", "chr", "start", "end", "width", "gene_name", "genomic_zone")
     front <- intersect(front, colnames(df))
     df[, c(front, setdiff(colnames(df), front)), drop = FALSE]
   })
@@ -2438,29 +2841,40 @@ server <- function(input, output, session) {
   # ------------------------------------------------------------------------------
   
   diffpeaks_data <- eventReactive(input$run_diffpeaks, {
-    
+
     req(rv$hmm, rv$marks)
-    
+
+    stage_names <- resolve_selected_stages(input$stages_diffpeaks)
+
     tryCatch({
-      
+
       withProgress(message = "Computing differential peaks…", {
-        
-        compute_differential_peaks(
-          hmm = rv$hmm,
-          marks = rv$marks,
-          score_thresh = input$diff_score_thresh,
-          width_thresh = input$diff_width_thresh
-        )
-        
+
+        compute_across_stages(stage_names, function(st) {
+          df <- compute_differential_peaks(
+            hmm          = st$hmm,
+            marks        = st$marks,
+            score_thresh = input$diff_score_thresh,
+            width_thresh = input$diff_width_thresh
+          )
+          if (is.null(df)) return(NULL)
+          # attr()s don't survive bind_rows() across stages, so carry the
+          # per-stage bookkeeping (total filtered segments, which two
+          # conditions this stage compares) as ordinary columns instead.
+          df$total_filtered   <- attr(df, "total_filtered")
+          df$stage_conditions <- paste(attr(df, "conditions"), collapse = " vs ")
+          df
+        })
+
       })
-      
+
     }, error = function(e) {
-      
+
       showNotification(
         paste0("Error: ", conditionMessage(e)),
         type = "error", duration = 15
       )
-      
+
       NULL
     })
   })
@@ -2470,35 +2884,57 @@ server <- function(input, output, session) {
   # ------------------------------------------------------------------------------
   
   build_diffpeaks_plot <- reactive({
-    
+
     df <- diffpeaks_data()
     req(df)
-    
-    total <- attr(df, "total_filtered")
-    if (is.null(total)) total <- sum(df$n_regions)
-    
-    conditions <- attr(df, "conditions")
-    cond1 <- conditions[1]
-    cond2 <- conditions[2]
-    
-    # order marks
+
+    multi_stage <- "stage" %in% colnames(df) && length(unique(df$stage)) > 1
+
+    # order marks (globally, across whichever stage(s) are shown)
     mark_order <- df %>%
       dplyr::group_by(mark) %>%
       dplyr::summarise(total = sum(n_regions), .groups = "drop") %>%
       dplyr::arrange(desc(total)) %>%
       dplyr::pull(mark)
-    
+
     df$mark <- factor(df$mark, levels = rev(mark_order))
-    
-    # dynamic colors (works for any condition names)
-    dirs <- unique(df$direction)
-    
+
+    # dynamic colors (works for any number/combination of directions, since
+    # each stage contributes its own two "condA-not-condB" / "condB-not-condA"
+    # categories and those can differ in name from stage to stage).
+    # Directions are ordered by where their leading condition sits in the
+    # user's life-cycle order, so the legend follows the same logic as
+    # everywhere else in the app.
+    dirs     <- unique(as.character(df$direction))
+    dir_rank <- vapply(dirs, function(d) {
+      pos <- match(sub("-not-.*$", "", d), ordered_conditions())
+      if (is.na(pos)) Inf else as.numeric(pos)
+    }, numeric(1))
+    dirs <- dirs[order(dir_rank, dirs)]
+    df$direction <- factor(as.character(df$direction), levels = dirs)
+
     fill_cols <- setNames(
-      c("#d6604d", "#4393c3")[seq_along(dirs)],
+      colorRampPalette(c("#d6604d", "#4393c3", "#8e44ad", "#27ae60"))(length(dirs)),
       dirs
     )
-    
-    ggplot(df, aes(x = mark, y = n_regions, fill = direction)) +
+
+    subtitle_txt <- if (multi_stage) {
+      info <- df %>% dplyr::distinct(stage, stage_conditions, total_filtered)
+      paste0(
+        paste0(info$stage, " (", info$stage_conditions, ", n=",
+              format(info$total_filtered, big.mark = ","), ")", collapse = "   |   "),
+        "\nscore≥", input$diff_score_thresh, ", width≥", input$diff_width_thresh, "bp"
+      )
+    } else {
+      paste0(
+        unique(df$stage_conditions)[1],
+        " | score≥", input$diff_score_thresh,
+        ", width≥", input$diff_width_thresh,
+        "bp | Total=", format(unique(df$total_filtered)[1], big.mark = ",")
+      )
+    }
+
+    p <- ggplot(df, aes(x = mark, y = n_regions, fill = direction)) +
       geom_col(position = position_dodge(width = 0.8), width = 0.7) +
       coord_flip() +
       scale_fill_manual(values = fill_cols) +
@@ -2507,18 +2943,17 @@ server <- function(input, output, session) {
         y = "Number of Regions",
         fill = NULL,
         title = "Pairwise Differential Peaks per Histone Mark",
-        subtitle = paste0(
-          cond1, " vs ", cond2,
-          " | score≥", input$diff_score_thresh,
-          ", width≥", input$diff_width_thresh,
-          "bp | Total=", format(total, big.mark = ",")
-        )
+        subtitle = subtitle_txt
       ) +
       theme_bw(base_size = 13) +
       theme(
         legend.position = "top",
         panel.grid.minor = element_blank()
       )
+
+    if (multi_stage) p <- p + facet_wrap(~ stage, ncol = 1)
+
+    p
   })
   
   # ------------------------------------------------------------------------------
@@ -2602,43 +3037,12 @@ server <- function(input, output, session) {
       return(NULL)
     }
 
-    if (identical(input$gsc_mode, "permutation")) {
+    mode        <- input$gsc_mode
+    stage_names <- resolve_selected_stages(input$stages_gsc)
+    stages      <- active_stages()
 
-      res <- tryCatch({
-        withProgress(message = "Building gene universe…", {
-          nms_all <- gene_names_reactive()
-
-          universe <- compute_all_gene_promoter_posteriors(
-            hmm                 = rv$hmm,
-            all_genes_gr        = rv$genes,
-            gene_labels         = nms_all,
-            upstream            = input$gsc_upstream,
-            downstream          = input$gsc_downstream,
-            average_replicates  = identical(input$gsc_replicate_mode, "average")
-          )
-          if (!is.null(universe$error)) return(list(error = universe$error))
-
-          incProgress(0.3, detail = paste0("Running ", input$gsc_n_perm, " random draws…"))
-          perm_res <- compute_gene_set_permutation(
-            all_gene_scores = universe$gene_scores,
-            post_cols       = universe$post_cols,
-            genes_A_labels  = sel_a,
-            n_perm          = input$gsc_n_perm,
-            summary_stat    = input$gsc_summary_stat
-          )
-          if (!is.null(perm_res$error)) return(list(error = perm_res$error))
-          perm_res$mode <- "permutation"
-          perm_res
-        })
-      }, error = function(e) list(error = paste0("Error: ", conditionMessage(e))))
-
-      if (!is.null(res$error)) {
-        showNotification(res$error, type = "error", duration = 12)
-        return(NULL)
-      }
-      return(res)
-
-    } else {
+    sel_b <- character(0)
+    if (identical(mode, "manual")) {
       sel_b <- gsc_genes_b_parsed(); sel_b <- sel_b[sel_b %in% nms]
       if (length(sel_b) == 0) {
         showNotification(
@@ -2647,33 +3051,113 @@ server <- function(input, output, session) {
         )
         return(NULL)
       }
-
-      genes_A_gr <- rv$genes[nms %in% sel_a]
-      mcols(genes_A_gr)$gene_label <- nms[nms %in% sel_a]
-      genes_B_gr <- rv$genes[nms %in% sel_b]
-      mcols(genes_B_gr)$gene_label <- nms[nms %in% sel_b]
-
-      res <- tryCatch({
-        withProgress(message = "Comparing gene sets…", {
-          compute_gene_set_posteriors(
-            hmm                 = rv$hmm,
-            genes_A_gr          = genes_A_gr,
-            genes_B_gr          = genes_B_gr,
-            upstream            = input$gsc_upstream,
-            downstream          = input$gsc_downstream,
-            average_replicates  = identical(input$gsc_replicate_mode, "average"),
-            summary_stat        = input$gsc_summary_stat
-          )
-        })
-      }, error = function(e) list(error = paste0("Error: ", conditionMessage(e))))
-
-      if (!is.null(res$error)) {
-        showNotification(res$error, type = "error", duration = 12)
-        return(NULL)
-      }
-      res$mode <- "manual"
-      res
     }
+
+    per_stage <- list()
+    err <- NULL
+
+    for (nm in stage_names) {
+      st <- stages[[nm]]
+      if (is.null(st)) next
+
+      if (identical(mode, "permutation")) {
+        res <- tryCatch({
+          withProgress(message = paste0("Building gene universe (", nm, ")…"), {
+            nms_all  <- gene_names_reactive()
+            universe <- compute_all_gene_promoter_posteriors(
+              hmm                 = st$hmm,
+              all_genes_gr        = rv$genes,
+              gene_labels         = nms_all,
+              upstream            = input$gsc_upstream,
+              downstream          = input$gsc_downstream,
+              average_replicates  = identical(input$gsc_replicate_mode, "average")
+            )
+            if (!is.null(universe$error)) return(list(error = paste0(nm, ": ", universe$error)))
+
+            incProgress(0.3, detail = paste0(nm, ": running ", input$gsc_n_perm, " random draws…"))
+            perm_res <- compute_gene_set_permutation(
+              all_gene_scores = universe$gene_scores,
+              post_cols       = universe$post_cols,
+              genes_A_labels  = sel_a,
+              n_perm          = input$gsc_n_perm,
+              summary_stat    = input$gsc_summary_stat
+            )
+            if (!is.null(perm_res$error)) return(list(error = paste0(nm, ": ", perm_res$error)))
+            perm_res
+          })
+        }, error = function(e) list(error = paste0("Error (", nm, "): ", conditionMessage(e))))
+      } else {
+        genes_A_gr <- rv$genes[nms %in% sel_a]
+        mcols(genes_A_gr)$gene_label <- nms[nms %in% sel_a]
+        genes_B_gr <- rv$genes[nms %in% sel_b]
+        mcols(genes_B_gr)$gene_label <- nms[nms %in% sel_b]
+
+        res <- tryCatch({
+          withProgress(message = paste0("Comparing gene sets (", nm, ")…"), {
+            compute_gene_set_posteriors(
+              hmm                 = st$hmm,
+              genes_A_gr          = genes_A_gr,
+              genes_B_gr          = genes_B_gr,
+              upstream            = input$gsc_upstream,
+              downstream          = input$gsc_downstream,
+              average_replicates  = identical(input$gsc_replicate_mode, "average"),
+              summary_stat        = input$gsc_summary_stat
+            )
+          })
+        }, error = function(e) list(error = paste0("Error (", nm, "): ", conditionMessage(e))))
+      }
+
+      if (!is.null(res$error)) { err <- res$error; break }
+      per_stage[[nm]] <- res
+    }
+
+    if (!is.null(err)) {
+      showNotification(err, type = "error", duration = 12)
+      return(NULL)
+    }
+    if (length(per_stage) == 0) return(NULL)
+
+    # Combine a given field across stages, tagging each stage's rows with a
+    # "stage" column before binding (per-object attr()s like summary_stat
+    # don't survive bind_rows, so those are looked up from `input` instead).
+    combine_field <- function(field) {
+      parts <- lapply(names(per_stage), function(nm) {
+        d <- per_stage[[nm]][[field]]
+        if (is.null(d)) return(NULL)
+        d$stage <- nm
+        d
+      })
+      parts <- Filter(Negate(is.null), parts)
+      if (length(parts) == 0) return(NULL)
+      out <- bind_rows(parts)
+      out$stage <- factor(out$stage, levels = names(per_stage))
+      apply_condition_order(out)
+    }
+
+    n_info <- if (identical(mode, "permutation")) {
+      data.frame(
+        stage   = names(per_stage),
+        n_A     = vapply(per_stage, function(x) x$n_A, numeric(1)),
+        n_total = vapply(per_stage, function(x) x$n_total, numeric(1)),
+        stringsAsFactors = FALSE
+      )
+    } else {
+      data.frame(
+        stage     = names(per_stage),
+        n_genes_A = vapply(per_stage, function(x) x$n_genes_A, numeric(1)),
+        n_genes_B = vapply(per_stage, function(x) x$n_genes_B, numeric(1)),
+        stringsAsFactors = FALSE
+      )
+    }
+
+    list(
+      error       = NULL,
+      mode        = mode,
+      stats       = combine_field("stats"),
+      long_scores = combine_field("long_scores"),
+      perm_long   = combine_field("perm_long"),
+      n_info      = n_info
+    )
   })
 
   output$gsc_stats_table <- renderDT({
@@ -2689,6 +3173,11 @@ server <- function(input, output, session) {
     }
     df$FDR <- signif(df$FDR, 3)
 
+    # Put stage first if present, for readability when two stages are shown
+    if ("stage" %in% colnames(df)) {
+      df <- df[, c("stage", setdiff(colnames(df), "stage")), drop = FALSE]
+    }
+
     datatable(df, options = list(pageLength = 10, order = list(list(which(colnames(df) == "FDR") - 1, "asc"))),
              rownames = FALSE) %>%
       formatStyle("FDR", backgroundColor = styleInterval(c(0.01, 0.05),
@@ -2698,11 +3187,18 @@ server <- function(input, output, session) {
   output$gsc_summary_stat_label <- renderUI({
     res <- gsc_result()
     req(res)
-    stat_used <- attr(res$stats, "summary_stat")
-    if (is.null(stat_used)) return(NULL)
+    stat_used <- input$gsc_summary_stat
+    n_txt <- if (identical(res$mode, "permutation")) {
+      paste(apply(res$n_info, 1, function(r)
+        paste0(r["stage"], ": n=", r["n_A"], " (universe ", r["n_total"], ")")), collapse = "  |  ")
+    } else {
+      paste(apply(res$n_info, 1, function(r)
+        paste0(r["stage"], ": A=", r["n_genes_A"], ", B=", r["n_genes_B"])), collapse = "  |  ")
+    }
     tags$small(style = "color:#555",
       paste0("Comparison statistic: ", tools::toTitleCase(stat_used),
-            " (delta and stat_A/stat_B columns use this; mean and median are both always shown where applicable)."))
+            " (delta and stat_A/stat_B columns use this; mean and median are both always shown where applicable).  ",
+            n_txt))
   })
 
   build_gsc_plot <- reactive({
@@ -2710,25 +3206,34 @@ server <- function(input, output, session) {
     req(res, res$long_scores)
 
     df <- res$long_scores
-    df$facet_label <- paste0(df$mark, " (", df$condition, ")")
+    # Order facets by mark, then by the user's life-cycle condition order
+    df$facet_label <- paste0(df$mark, " (", as.character(df$condition), ")")
+    lvl_grid <- expand.grid(
+      cond = intersect(ordered_conditions(), unique(as.character(df$condition))),
+      mark = sort(unique(as.character(df$mark))),
+      stringsAsFactors = FALSE
+    )
+    facet_levels <- paste0(lvl_grid$mark, " (", lvl_grid$cond, ")")
+    df$facet_label <- factor(df$facet_label,
+                             levels = intersect(facet_levels, unique(df$facet_label)))
+    multi_stage <- "stage" %in% colnames(df) && length(unique(df$stage)) > 1
 
     if (identical(res$mode, "permutation")) {
       group_colors <- c("A" = "#4393c3", "Random" = "#999999")
       df$group <- factor(df$group, levels = c("A", "Random"))
-      subtitle_txt <- paste0(res$n_A, " genes in set A  |  ", res$n_A,
-                            " genes in one representative random draw  |  ",
-                            "empirical p-value uses ", nrow(res$perm_long) / length(unique(res$perm_long$mark)),
-                            " random draws total (see stats table)")
+      n_txt <- paste(apply(res$n_info, 1, function(r) paste0(r["stage"], ": n=", r["n_A"])), collapse = "  |  ")
+      subtitle_txt <- paste0(n_txt, " genes in set A (vs. one representative random draw of the same size) — ",
+                            "empirical p-value uses ", input$gsc_n_perm, " random draws total per stage (see stats table)")
     } else {
       group_colors <- c("A" = "#4393c3", "B" = "#d6604d")
-      subtitle_txt <- paste0("Set A: ", res$n_genes_A, " genes  |  Set B: ", res$n_genes_B, " genes")
+      subtitle_txt <- paste(apply(res$n_info, 1, function(r)
+        paste0(r["stage"], ": A=", r["n_genes_A"], " genes, B=", r["n_genes_B"], " genes")), collapse = "  |  ")
     }
 
-    ggplot(df, aes(x = group, y = posterior, fill = group)) +
+    p <- ggplot(df, aes(x = group, y = posterior, fill = group)) +
       geom_boxplot(outlier.shape = NA, alpha = 0.7) +
       geom_jitter(width = 0.15, alpha = 0.3, size = 0.8) +
       scale_fill_manual(values = group_colors) +
-      facet_wrap(~ facet_label, scales = "free_y") +
       labs(
         x = "Gene set", y = "Mean posterior probability over promoter",
         fill = "Gene set",
@@ -2741,6 +3246,14 @@ server <- function(input, output, session) {
         strip.text       = element_text(colour = "white", face = "bold"),
         legend.position  = "top"
       )
+
+    if (multi_stage) {
+      p <- p + facet_grid(stage ~ facet_label, scales = "free_y")
+    } else {
+      p <- p + facet_wrap(~ facet_label, scales = "free_y")
+    }
+
+    p
   })
 
   output$gsc_boxplot <- renderPlot({ build_gsc_plot() })
@@ -2775,8 +3288,10 @@ server <- function(input, output, session) {
     res <- gsc_result()
     req(res, res$long_scores)
 
-    df <- res$long_scores[res$long_scores$group == "A",
-                          c("gene", "mark", "condition", "posterior")]
+    cols <- c("gene", "mark", "condition", "posterior")
+    if ("stage" %in% colnames(res$long_scores)) cols <- c("stage", cols)
+
+    df <- res$long_scores[res$long_scores$group == "A", cols]
     df$posterior <- round(df$posterior, 4)
     colnames(df)[colnames(df) == "posterior"] <- "mean_posterior_set_A"
     datatable(df, extensions = "Buttons",
