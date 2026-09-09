@@ -84,4 +84,29 @@ Selecting "All chromosomes" in Region Browser, or running thousands of permutati
 Contact
 Built for chromatin/epigenomics analysis in Echinococcus multilocularis by Janan Gawra.
 
- linkedin.com/in/janangawra
+New_updates_09/09/2026
+### Multi-condition support
+
+The app now works with ChromstaR objects containing any number of conditions,
+not just two.
+
+**Differential Peaks** — choose 2–5 conditions and how they are paired:
+
+- *All pairwise combinations* — one panel per pair (5 conditions → 10 panels)
+- *One reference vs the others* — every condition against a reference you pick
+  (5 conditions → 4 panels), useful for a life-cycle baseline
+
+Segments are filtered once on `differential.score` and width; then, for each
+pair, only segments whose chromatin state actually differs between those two
+conditions are counted, per mark, in both directions. Bars are coloured by the
+condition the mark is present in, using the app-wide condition palette, and the
+plot canvas scales with the number of panels.
+
+**Condition / Life-cycle Order** — the box on the Load tab now controls both
+order *and* membership: removing a condition hides it from every plot, table and
+analysis, and it is excluded from the computations rather than filtered after
+the fact. "Reset to detected order" restores all detected conditions.
+
+
+
+linkedin.com/in/janangawra
