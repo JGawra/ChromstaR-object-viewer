@@ -1,112 +1,336 @@
-About ChromstaR Viewer
+# About ChromstaR Viewer
 
-What this tool does
-ChromstaR Viewer is a point-and-click app for exploring chromatin state and histone modification signal from a ChromstaR combinedMultiHMM object, alongside a gene annotation. It lets you compare experimental conditions (e.g. PA vs PNA) across multiple histone marks, browse specific genomic regions, and compare gene sets — all without writing any R code. Use the sidebar on the left to move between tabs; each tab is independent, so you can jump around in any order once data is loaded.
+## What this tool does
 
-1. Load Data tab
-Purpose: upload your data. Nothing else works until this is done.
+ChromstaR Viewer is a point-and-click app for exploring chromatin state and histone
+modification signal from a ChromstaR `combinedMultiHMM` object, alongside a gene
+annotation. It lets you compare experimental conditions or developmental stages
+across multiple histone marks, browse specific genomic regions, quantify
+differential chromatin states, and compare gene sets — all without writing any R
+code.
 
-"Upload ChromstaR .RData file" (left box) — click to browse for your ChromstaR combinedMultiHMM object (a .RData / .rda file). A text box below it shows a summary once loaded (object class, bin count, etc).
-"Upload genes.tsv file" (right box) — click to browse for your gene annotation. This should be a simple table with columns chr, start, end, gene_id, gene_name, strand — convert a GTF to this format first if needed.
-Detected Marks & Conditions panel at the bottom fills in automatically once both files are loaded — it lists every histone mark, every condition, and basic genome info found in your object. Use this to sanity-check the upload before moving to other tabs.
-2. Metagene Profile tab
-Purpose: plot average signal (RPKM) around a reference point (TSS, TES, or across the gene body) for a chosen set of genes, one panel per histone mark.
+Use the sidebar on the left to move between tabs. Each tab is independent, so you
+can jump around in any order once data is loaded. Every tab has its own **Compute**
+button: changing a setting does nothing until you click it.
 
-"Reference" checkboxes — tick TSS, TES, and/or Gene body. You can tick more than one to compare them side by side in the same plot.
-"Upstream (bp)" / "Downstream (bp)" — only shown when TSS or TES is ticked; sets how far before/after the reference point to plot. A live summary line below shows exactly what window this produces.
-"Number of bins" — how many segments to divide the window/gene body into; more bins = finer resolution but a noisier-looking line.
-"Gene scope" — "Only selected genes" uses whatever you've pasted below; "All genes in GTF" ignores the pasted list and runs on every gene in the annotation.
-"Select all" / "Clear all" buttons — fill or empty the gene textbox below with every gene name from the annotation.
-Gene textbox — paste gene IDs here, one per line (e.g. copy-pasted from an Excel column). A match count appears underneath showing how many were recognised.
-"Marks to display" checkboxes — tick which histone marks to include in the plot.
-"Condition comparison" — "Side-by-side" puts each condition in its own facet panel; "Overlay" draws all conditions on the same axes with different colours.
-"Smooth curve (LOESS)" checkbox — draws a smoothed line instead of the raw jagged signal; recommended when plotting many genes at once.
-"Compute Profile" — runs the calculation and draws the plot. Nothing happens until you click this, even if you change settings above.
-"Download Plot" — saves the current plot as a PDF.
-"Download Data (Excel)" — saves the exact numbers behind the plot (one row per bin/mark/condition) as an .xlsx file.
-3. Enrichment Profile tab
-Purpose: plot log(observed/expected) enrichment of each mark around gene boundaries (TSS and TES together), one panel per mark — useful for seeing which marks are relatively enriched or depleted across a gene versus the genome-wide average.
+---
 
-"Upstream of TSS (bp)" / "Downstream of TES (bp)" — how far before the start and after the end of each gene to include.
-"Bins per region" — resolution of the plot; more bins = finer detail.
-"Gene scope", "Select all"/"Clear all", gene textbox, "Marks to display" — same behaviour as the equivalent controls in the Metagene Profile tab above.
-"Smooth curve (LOESS)" checkbox — same as Metagene tab, smooths the line.
-"Compute Enrichment" — runs the calculation and draws the plot.
-"Download Plot" / "Download Data (Excel)" — same as Metagene tab: save the figure as PDF, or the underlying numbers as Excel.
-4. Region Browser tab
-Purpose: a genome-browser-style view of raw signal across a chosen chromosome and position range, or across whole chromosomes at once — for zooming into a specific locus.
+## 1. Load Data tab
 
-"Chromosome scope" — "Single chromosome" lets you zoom into a specific bp range (most common use); "Selected chromosomes" or "All chromosomes" show entire chromosome(s) at full length instead, useful for a wide overview but can be slow/cluttered with many small contigs.
-Chromosome dropdown — pick which chromosome(s) to view (becomes a multi-select box in "Selected chromosomes" mode).
-"Start (bp)" / "End (bp)" — only shown in single-chromosome mode; defines the exact window to zoom into.
-"Jump to gene" dropdown plus the "Flanking (bp)" box and the "Go" button — instead of typing coordinates by hand, pick a gene name here, set how much flanking sequence you want on each side, and click "Go" to jump the Start/End boxes straight to that gene's location.
-"Bin scope" — "All bins, including intergenic" shows everything; "Only bins inside a gene" or "Only intergenic bins" filter the view using the loaded gene annotation.
-"Marks to display" checkboxes — tick which histone marks to show as tracks.
-"Condition comparison" — "Side-by-side" or "Overlay", same meaning as in the Metagene tab.
-"Load Region" — fetches and draws the signal for the current settings.
-"Download Plot" — saves the current view as a PDF.
-5. Differential Peaks tab
-Purpose: counts, per histone mark, how many chromatin segments are confidently present in one condition but not the other (and vice versa) — a bar chart summarising which marks change the most between conditions.
+**Purpose:** upload your data. Nothing else works until this is done.
 
-"Min differential score" — only keep chromatin segments with a confidence score at or above this threshold (closer to 1 = stricter, fewer but more confident segments).
-"Min merged region width (bp)" — discard segments shorter than this, to avoid counting tiny noisy regions.
-"Compute Differential Peaks" — runs the filtering and counting, then draws the bar chart.
-"Download Plot" / "Download Data (Excel)" — save the figure as PDF, or the underlying per-mark counts as Excel.
-6. Gene Set Comparison tab
-Purpose: compares the average histone-mark "posterior probability" (confidence that a mark is present) over the promoter region of one gene list against either a second gene list you provide, or a random background — useful for asking "is this curated gene set unusual for a given mark?" or "do up- and down-regulated genes differ in chromatin state?"
+- **"Label for this dataset (used in plots)"** — the name this object gets in plot
+  legends, facet strips and exported tables. Defaults to "Stage A".
+- **"Upload ChromstaR .RData or .rds file" (Stage A)** — your ChromstaR
+  `combinedMultiHMM` object. A summary appears once loaded (object class, bin
+  count, and so on).
+- **Stage B (optional)** — a second, independent ChromstaR object, e.g. a
+  different developmental stage or a separate experiment. It does **not** need to
+  share bin coordinates with Stage A: every analysis runs on each object
+  separately and the results are combined and labelled by stage. Once Stage B is
+  loaded, every analysis tab gains a **"Stages to compare"** control.
+- **"Upload genes.tsv file"** — the gene annotation, shared by both stages. A
+  plain table with columns `chr, start, end, gene_id, gene_name, strand`. Convert
+  a GTF to this format first. Coordinates are read as 1-based inclusive (GTF
+  convention); a BED file's 0-based starts will be off by one.
+- **Detected Marks & Conditions panel** — fills in automatically and lists every
+  histone mark, every condition, and the genome info found in each object. Check
+  this before moving on: the chromosome names shown here must match the names in
+  your gene table, or nothing will be annotated as genic.
 
-"Upstream of TSS (bp)" / "Downstream of TSS (bp)" — defines the promoter window averaged over for every gene.
-"Replicates" — "Average across replicates" merges rep1/rep2/etc into one number per mark/condition; "Show each replicate separately" keeps them apart so you can check replicate consistency.
-"Summary statistic" — choose Mean or Median as the main number used to compare the two groups (both are always shown side by side in the results table regardless of this choice).
-"Comparison type" — "Compare to a random background" runs a permutation test against many random gene sets of the same size (statistically rigorous, recommended default); "Compare to a second gene list I provide" lets you paste an actual second list instead (e.g. down-regulated genes).
-Gene set A textbox — paste your main gene list here, one ID per line.
-"Number of random draws" — only shown in random-background mode; how many random gene sets to sample for the statistical test. Higher = more precise p-values but slower (1000 is a good default; thousands for a final result).
-Gene set B textbox — only shown in manual mode; paste your second gene list here.
-"Compare Gene Sets" — runs the comparison and fills in the results table, plot, and per-gene table below.
-Results table (top right) — one row per mark/condition, sorted by FDR (most significant first); colour-coded green/yellow by significance.
-Boxplot — shows the spread of individual gene values for set A vs set B (or vs one representative random draw), one panel per mark.
-"Download Plot" / "Download Data (Excel)" — save the boxplot as PDF, or the full results (stats + per-gene values) as a multi-sheet Excel file.
-Per-gene table (bottom) — one row per gene in set A, showing its individual posterior value per mark/condition; sortable, filterable by column, and exportable directly as CSV/Excel using the buttons above the table.
-7. Data Table tab
-Purpose: the full per-bin chromatin state table, annotated with which gene (if any) and which genomic zone (TSS, gene body thirds, upstream/downstream flanks, or intergenic) each bin falls into.
+### Condition / Life-cycle Order
 
-"Download full table (CSV)" — exports every row (500k+) to CSV. Use this rather than the table's own export, which only reliably handles small subsets.
-Table itself — scrollable and sortable by column; use the search boxes to filter by gene name, zone, or other fields.
-Key concepts that apply across several tabs
-Gene scope (Metagene/Enrichment tabs): "only selected genes" vs "all genes in GTF." Both modes only ever include bins overlapping a gene — there's no "intergenic" position relative to a TSS or gene body.
-Bin/Chromosome scope (Region Browser tab): whether to see every bin (including intergenic), only genic bins, or only intergenic bins; and whether to zoom into one chromosome or view several/all at full length.
-RPKM vs log(observed/expected) — Metagene and Region Browser show raw mean RPKM signal. Enrichment Profile shows a log-ratio against the genome-wide average for that mark/condition, better for comparing marks with very different baseline signal levels.
-Posterior probability (Gene Set Comparison tab) — a 0-1 confidence score from ChromstaR that a given mark is genuinely present at a bin, distinct from the RPKM signal used elsewhere.
-Performance tips
-Computations are vectorised and should stay fast even with all genes selected, but very large gene sets combined with many marks can still take a few seconds.
-The Data Table's gene/zone annotation is computed once per session and cached — the first visit to that tab may take a little longer.
-Selecting "All chromosomes" in Region Browser, or running thousands of permutations in Gene Set Comparison, will be noticeably slower — start with smaller values to preview, then scale up for a final result.
-Contact
-Built for chromatin/epigenomics analysis in Echinococcus multilocularis by Janan Gawra.
+The box at the bottom of the Load tab controls **both the order and the membership**
+of conditions across the entire app.
 
-New_updates_09/09/2026
-### Multi-condition support
+- **Drag** the boxes to arrange conditions in a biologically meaningful order
+  (e.g. `TwoDO → Meta → PNA → PA`, or `cerca → somula → mira → sp1 → adult`)
+  instead of the default alphabetical order. That order is then applied
+  everywhere at once: legend order, facet strips, the order of `rpkm_*` columns
+  in the exported table, and which colour each condition gets.
+- **Remove** a condition (the × on its box) and it is hidden from every plot,
+  table and analysis — it is excluded from the computation itself, not filtered
+  out afterwards.
+- **"Reset to detected order"** restores every condition found in the loaded
+  objects.
+- A coloured preview strip below the box shows the current order and each
+  condition's colour.
 
-The app now works with ChromstaR objects containing any number of conditions,
-not just two.
+---
 
-**Differential Peaks** — choose 2–5 conditions and how they are paired:
+## 2. Metagene Profile tab
 
-- *All pairwise combinations* — one panel per pair (5 conditions → 10 panels)
-- *One reference vs the others* — every condition against a reference you pick
-  (5 conditions → 4 panels), useful for a life-cycle baseline
+**Purpose:** plot average signal (RPKM) around a reference point — TSS, TES, or
+across the gene body — for a chosen set of genes, one panel per histone mark.
 
-Segments are filtered once on `differential.score` and width; then, for each
-pair, only segments whose chromatin state actually differs between those two
-conditions are counted, per mark, in both directions. Bars are coloured by the
-condition the mark is present in, using the app-wide condition palette, and the
-plot canvas scales with the number of panels.
+- **"Reference" checkboxes** — tick TSS, TES and/or Gene body. More than one can
+  be ticked; panels are laid out in biological order, **TSS → Gene body → TES**.
+- **"Upstream (bp)" / "Downstream (bp)"** — shown when TSS or TES is ticked; sets
+  the window before and after the reference point. A live summary line shows the
+  exact window produced.
+- **"Number of bins"** — how many segments the window or gene body is divided
+  into. Choose this relative to your ChromstaR bin size: for a 4,000 bp window
+  built from 250 bp bins, roughly 16–40 bins is right. Asking for many more bins
+  than the data supports (e.g. 100 bins over 4 kb of 250 bp bins) produces a
+  jagged line made of gaps, not finer resolution.
+- **"Gene scope"** — "Only selected genes" uses the pasted list below; "All genes
+  in GTF" ignores it and runs on every gene in the annotation.
+- **"Select all" / "Clear all"** and the **gene textbox** — paste gene IDs, one
+  per line (e.g. straight from an Excel column). A match count appears underneath
+  showing how many were recognised and, if any failed, examples of the misses.
+- **"Marks to display"** — which histone marks to include.
+- **"Condition comparison"** — "Side-by-side" gives each condition its own facet;
+  "Overlay" draws all conditions on the same axes in different colours.
+- **"Smooth curve (LOESS)"** — draws a smoothed line instead of the raw signal;
+  useful with many genes, but check the raw line too before interpreting a bump.
+- **"Compute Profile"**, **"Download Plot"** (PDF), **"Download Data (Excel)"**
+  (one row per bin/mark/condition).
 
-**Condition / Life-cycle Order** — the box on the Load tab now controls both
-order *and* membership: removing a condition hides it from every plot, table and
-analysis, and it is excluded from the computations rather than filtered after
-the fact. "Reset to detected order" restores all detected conditions.
+**Strand.** Profiles are strand-aware: the window is placed relative to each
+gene's own orientation and minus-strand genes are flipped before averaging, so
+position 0% is always the 5′ end. Without that flip a promoter mark appears at
+*both* ends of the gene body.
 
+---
 
+## 3. Enrichment Profile tab
 
-linkedin.com/in/janangawra
+**Purpose:** plot log(observed/expected) enrichment around gene boundaries — the
+upstream flank, the gene body as a percentage of gene length, and the downstream
+flank on one continuous axis.
+
+- **"Upstream of TSS (bp)" / "Downstream of TES (bp)"** — how far before the start
+  and after the end of each gene to include.
+- **"Bins per region"** — resolution of the curve.
+- **"Gene scope"**, **"Select all"/"Clear all"**, gene textbox, **"Marks to
+  display"** — same behaviour as the Metagene tab.
+- **"Panel layout"**
+  - *One panel per mark (colour = condition)* — conditions overlaid inside each
+    mark's panel. Best for asking how a single mark changes across the life cycle.
+  - *One panel per condition (colour = mark)* — all marks overlaid inside each
+    condition's panel, the layout used by the Galaxy chromstaR output. Best for
+    asking which marks dominate at a given stage. Panels share one y-axis so
+    conditions can be compared directly.
+- **"Expected (baseline)"** — the denominator of log(observed/expected).
+  - *Mean over covered bins (signal > 0)* — the default. The observed side has to
+    drop zero-signal bins because log(0) is undefined, so this keeps numerator and
+    denominator on the same set of bins.
+  - *Mean over all genomic bins* — divides by a mean that includes every empty
+    bin. This shifts each curve upward by log(mean covered / mean all); because
+    coverage sparsity differs per mark and per condition, the shift differs per
+    curve and conditions can no longer be compared by vertical position.
+- **"Smooth curve (LOESS)"**, **"Compute Enrichment"**, **"Download Plot"**,
+  **"Download Data (Excel)"**.
+
+---
+
+## 4. Region Browser tab
+
+**Purpose:** a genome-browser-style view of raw signal across a chosen chromosome
+and position range, or across whole chromosomes at once.
+
+- **"Chromosome scope"** — "Single chromosome" to zoom into a bp range (the usual
+  case); "Selected chromosomes" or "All chromosomes" to view entire chromosomes,
+  useful as an overview but slower and more cluttered.
+- **Chromosome dropdown** — which chromosome(s) to view (multi-select in
+  "Selected chromosomes" mode).
+- **"Start (bp)" / "End (bp)"** — the window, in single-chromosome mode.
+- **"Jump to gene"** plus **"Flanking (bp)"** and **"Go"** — pick a gene by name,
+  set the flanking sequence, and the Start/End boxes jump to that locus.
+- **"Bin scope"** — all bins including intergenic, only bins inside a gene, or
+  only intergenic bins, using the loaded annotation.
+- **"Marks to display"**, **"Condition comparison"** — as in the Metagene tab.
+- **"Load Region"**, **"Download Plot"** (PDF).
+
+---
+
+## 5. Differential Peaks tab
+
+**Purpose:** counts, per histone mark, how many chromatin segments are confidently
+present in one condition but not another (and vice versa) — a bar chart of which
+marks change most between conditions. Any number of conditions is supported.
+
+- **"Min differential score"** — keep only segments with a confidence score at or
+  above this threshold (closer to 1 = stricter).
+- **"Min merged region width (bp)"** — discard segments shorter than this.
+- **"Gene scope"**
+  - *Whole genome (all segments)* — the default, and what the Galaxy differential
+    tool does.
+  - *Only selected genes* — keeps only segments overlapping the genes you paste
+    in, with the same Select all / Clear all buttons and live match counter as the
+    other tabs. Use it to ask whether a specific gene set is remodelled between
+    stages.
+- **"Conditions to compare"** — pick 2 to 5 conditions from the loaded object.
+  Drag to reorder, × to remove.
+- **"Comparison mode"**
+  - *All pairwise combinations* — one panel per pair (5 conditions → 10 panels).
+  - *One reference vs the others* — every chosen condition against a reference you
+    pick (5 conditions → 4 panels), usually what you want for a life-cycle
+    baseline.
+- **"Stages to compare"** — appears once Stage B is loaded; each stage is filtered
+  and counted independently and gets its own row of panels.
+- **"Compute Differential Peaks"**, **"Download Plot"**, **"Download Data
+  (Excel)"**.
+
+**How it works.** Segments are filtered once on `differential.score` and width.
+Then, for each pair of conditions, only the segments whose combinatorial state
+actually differs between those two conditions are kept, and each mark is counted
+in both directions. Bars are coloured by the condition the mark is present in,
+using the app-wide condition palette, and the plot canvas grows with the number of
+panels.
+
+---
+
+## 6. Gene Set Comparison tab
+
+**Purpose:** compares the average histone-mark posterior probability over the
+promoter region of one gene list against either a second gene list or a random
+background — for asking "is this curated gene set unusual for a given mark?" or
+"do up- and down-regulated genes differ in chromatin state?"
+
+- **"Upstream of TSS (bp)" / "Downstream of TSS (bp)"** — the promoter window
+  averaged over for every gene.
+- **"Replicates"** — "Average across replicates" merges rep1/rep2/… into one
+  number per mark/condition; "Show each replicate separately" keeps them apart so
+  you can check replicate consistency.
+- **"Summary statistic"** — Mean or Median as the headline number (both are always
+  shown in the results table).
+- **"Comparison type"** — "Compare to a random background" runs a permutation test
+  against many random gene sets of the same size (the statistically rigorous
+  default); "Compare to a second gene list I provide" lets you paste an actual
+  second list.
+- **Gene set A textbox** — your main gene list, one ID per line.
+- **"Number of random draws"** — random-background mode only. Higher gives more
+  precise empirical p-values but is slower; 1,000 is a good working default,
+  several thousand for a final figure.
+- **Gene set B textbox** — manual mode only.
+- **"Compare Gene Sets"** — fills in the results table, plot and per-gene table.
+- **Results table** — one row per mark/condition, sorted by FDR, colour-coded by
+  significance.
+- **Boxplot** — the spread of individual gene values for set A vs set B (or vs one
+  representative random draw), one panel per mark.
+- **Per-gene table** — one row per gene in set A with its posterior value per
+  mark/condition; sortable, filterable, exportable.
+- **"Download Plot"** (PDF), **"Download Data (Excel)"** (multi-sheet).
+
+---
+
+## 7. Data Table tab
+
+**Purpose:** the full per-bin chromatin state table, annotated with which gene (if
+any) and which genomic zone each bin falls into — TSS ±200 bp, gene body thirds,
+upstream/downstream flanks, or intergenic.
+
+- **"Download full table (CSV)"** — exports every row. Use this rather than the
+  table's own export, which only reliably handles small subsets.
+- **Table itself** — scrollable, sortable, with per-column search boxes.
+- `rpkm_<mark>_<condition>` columns are emitted in your chosen life-cycle order,
+  and only for the conditions you kept in the Condition / Life-cycle Order box.
+
+**Check the `genomic_zone` column.** If every bin says "Intergenic", the gene
+annotation matched nothing — almost always a chromosome-naming mismatch between
+the ChromstaR object and the gene table. The app now warns you when this happens
+and prints both sets of names.
+
+---
+
+## Key concepts that apply across several tabs
+
+- **Gene scope** (Metagene, Enrichment, Differential Peaks): "only selected genes"
+  vs everything. On the Metagene and Enrichment tabs, both modes only ever include
+  bins overlapping a gene — there is no "intergenic" position relative to a TSS.
+- **Bin / chromosome scope** (Region Browser): every bin, only genic, or only
+  intergenic; one chromosome zoomed in, or several at full length.
+- **RPKM vs log(observed/expected)** — Metagene and Region Browser show raw mean
+  RPKM. Enrichment Profile shows a log-ratio against a genome-wide baseline,
+  better for comparing marks with very different baseline signal levels.
+- **Posterior probability** (Gene Set Comparison) — ChromstaR's 0–1 confidence
+  that a mark is genuinely present at a bin, distinct from the RPKM signal used
+  elsewhere.
+- **Stages vs conditions** — *conditions* live inside one ChromstaR object
+  (jointly modelled by the HMM). *Stages* are two separate objects loaded side by
+  side, computed independently and combined afterwards.
+
+---
+
+## Checking that a result is real
+
+- **Set the bin count relative to your bin size.** More plotted points than the
+  data supports gives noise, not resolution.
+- **Split genes by strand** and run the metagene on `+` genes only, then `−` genes
+  only. The two profiles must look the same. Mirror images mean orientation is
+  broken.
+- **Shift the annotation** by 50 kb and re-run: every profile should flatten.
+  A peak that survives is an artifact of window geometry, not of the TSS.
+- **Check a housekeeping gene** in the Region Browser — H3K4me3 should be a sharp
+  peak at its TSS.
+- **Check the mitochondrial and unplaced contigs** — they should carry essentially
+  no real ChIP enrichment.
+- **Check coverage per mark and condition** — the fraction of zero-signal bins. A
+  mark with very few covered bins produces a metagene driven by a handful of
+  regions.
+- **Check replicate concordance** in Gene Set Comparison with "Show each replicate
+  separately".
+- **Check direction balance** in Differential Peaks — if nearly every change is
+  gained in one condition for every mark, suspect sequencing depth or
+  normalisation rather than biology.
+- **Vary the thresholds.** Re-run at differential score 0.99 / 0.999 / 0.9999 and
+  several widths; the ranking of marks should be stable.
+
+---
+
+## Performance tips
+
+- Computations are vectorised and stay fast with all genes selected, but very
+  large gene sets combined with many marks can take a few seconds.
+- The Data Table's gene/zone annotation is computed once per session and cached;
+  the first visit to that tab takes a little longer. Loading a new gene file
+  clears the cache so the table is rebuilt against the new annotation.
+- "All chromosomes" in the Region Browser, and thousands of permutations in Gene
+  Set Comparison, are noticeably slower — preview with smaller values, then scale
+  up for the final result.
+- All-pairwise mode with 5 conditions draws 10 panels; the canvas grows to match,
+  so expect a taller plot and a slightly longer render.
+
+---
+
+## Updates
+
+### 09/09/2026
+
+**Multi-condition support.** The app now works with ChromstaR objects containing
+any number of conditions, not just two. Differential Peaks gained a condition
+picker (2–5) and two comparison modes — all pairwise combinations, or one
+reference vs the others.
+
+**Condition / Life-cycle Order now filters as well as orders.** Removing a
+condition hides it from every plot, table and analysis, and it is excluded from
+the computation rather than filtered afterwards.
+
+**Metagene profiles are strand-aware.** Minus-strand genes were being averaged in
+backwards, which made promoter marks appear at both ends of the gene body and
+symmetrised the TSS profile. Positions are now flipped for minus-strand genes, and
+bins whose midpoint falls outside the window are dropped instead of being piled
+into the first and last plot points. Reference panels are ordered TSS → Gene body
+→ TES.
+
+**Enrichment Profile: Galaxy-style layout.** A new panel layout puts one condition
+per panel with all marks overlaid, alongside the existing one-panel-per-mark view.
+
+**Enrichment Profile: corrected baseline.** The observed side drops zero-signal
+bins, but the expected value was previously a mean over all bins including empty
+ones, shifting each curve up by an amount that differed per mark and per
+condition. The baseline now defaults to the mean over covered bins; the old
+behaviour remains selectable.
+
+**Differential Peaks: gene scope.** Restrict the analysis to a pasted gene list
+instead of the whole genome.
+
+**Bin annotation cache fixed.** The per-bin gene/zone annotation is now recomputed
+when a new gene file is loaded, and the app warns when the annotation matches zero
+bins (usually a chromosome-naming mismatch).
+
+---
+
+Built for chromatin and epigenomics analysis by Janan Gawra.
+[linkedin.com/in/janangawra](https://linkedin.com/in/janangawra)
