@@ -938,7 +938,7 @@ ui <- dashboardPage(
         fluidRow(
           box(title = "Condition / Life-cycle Order", width = 12, status = "warning",
             tags$small(style = "color:#888",
-              HTML("Sets the order conditions appear in <b>every</b> plot legend, facet strip, and results table across the whole app. Drag the boxes below to arrange them into a biologically meaningful order — e.g. <b>TwoDO &rarr; Meta &rarr; PNA &rarr; PA</b> to follow the life cycle — instead of the default alphabetical order. Colours follow this order too, so the first condition always gets the first colour.")),
+              HTML("Sets which conditions are used and the order they appear in <b>every</b> plot legend, facet strip, and results table across the whole app. Drag the boxes below to arrange them into a biologically meaningful order &mdash; e.g. <b>TwoDO &rarr; Meta &rarr; PNA &rarr; PA</b> to follow the life cycle &mdash; instead of the default alphabetical order. Colours follow this order too, so the first condition always gets the first colour. <b>Removing a condition (the &times; on its box) hides it everywhere in the app</b>; \"Reset to detected order\" brings them all back.")),
             br(), br(),
             uiOutput("condition_order_ui"),
             actionButton("reset_condition_order", "Reset to detected order",
@@ -1141,23 +1141,37 @@ ui <- dashboardPage(
         fluidRow(
           box(title = "Differential Peak Settings", width = 3, status = "warning",
             tags$small(style = "color:#888",
-              "Reproduces differential chromatin states analysis: filters merged chromatin segments by score, width, and a PA≠PNA state change, then counts how many filtered segments contain each mark in PA but not PNA (and vice versa)."),
+              "Filters merged chromatin segments by differential score and width, then — for each pair of conditions you choose — counts how many of those segments carry each mark in one condition but not the other. Works with any number of conditions in the object."),
             hr(),
             numericInput("diff_score_thresh", "Min differential score",
                         value = 0.9999, min = 0, max = 1, step = 0.0001),
             numericInput("diff_width_thresh", "Min merged region width (bp)",
                         value = 300, min = 0, step = 100),
             hr(),
+            h5("Conditions to compare"),
+            uiOutput("diff_condition_ui"),
+            tags$small(style = "color:#888",
+              "Pick 2–5 conditions. Drag to reorder; the × removes one."),
+            br(), br(),
+            radioButtons("diff_mode", "Comparison mode",
+              choices = c("All pairwise combinations" = "pairwise",
+                          "One reference vs the others" = "reference"),
+              selected = "pairwise"),
+            conditionalPanel(
+              condition = "input.diff_mode == 'reference'",
+              uiOutput("diff_ref_ui")
+            ),
+            hr(),
             h5("Stages to compare"),
             uiOutput("stage_selector_diffpeaks"),
             tags$small(style = "color:#888",
-              "Each stage has its own pair of conditions, so this runs the same filtering/counting pipeline independently per stage and shows them as separate panels."),
+              "Each stage is filtered and counted independently and shown in its own row of panels."),
             hr(),
             actionButton("run_diffpeaks", "Compute Differential Peaks",
                         class = "btn-primary btn-block")
           ),
-          box(title = "Pairwise Differential Peaks per Histone Mark", width = 9, status = "primary",
-            plotOutput("diffpeaks_plot", height = "550px"),
+          box(title = "Differential Peaks per Histone Mark", width = 9, status = "primary",
+            uiOutput("diffpeaks_plot_container"),
             downloadButton("dl_diffpeaks_plot", "Download Plot"),
             downloadButton("dl_diffpeaks_xlsx", "Download Data (Excel)")
           )
@@ -1318,10 +1332,13 @@ ui <- dashboardPage(
 
               hr(),
               tags$h3("5. Differential Peaks tab"),
-              tags$p(tags$b("Purpose:"), " counts, per histone mark, how many chromatin segments are confidently present in one condition but not the other (and vice versa) — a bar chart summarising which marks change the most between conditions."),
+              tags$p(tags$b("Purpose:"), " counts, per histone mark, how many chromatin segments are confidently present in one condition but not another (and vice versa) — a bar chart summarising which marks change the most between conditions. Any number of conditions is supported: you choose which ones to compare and how they are paired up."),
               tags$ul(
                 tags$li(tags$b("\"Min differential score\""), " — only keep chromatin segments with a confidence score at or above this threshold (closer to 1 = stricter, fewer but more confident segments)."),
                 tags$li(tags$b("\"Min merged region width (bp)\""), " — discard segments shorter than this, to avoid counting tiny noisy regions."),
+                tags$li(tags$b("\"Conditions to compare\""), " — pick between 2 and 5 conditions from the loaded object. Only these are used on this tab."),
+                tags$li(tags$b("\"Comparison mode\""), " — \"All pairwise combinations\" makes one panel for every possible pair of the chosen conditions (5 conditions = 10 panels); \"One reference vs the others\" compares every chosen condition against a single reference you pick (5 conditions = 4 panels), which is usually what you want for a life-cycle baseline."),
+                tags$li("Within each panel, the two bars per mark are coloured by the condition the mark is present in — same colours as everywhere else in the app."),
                 tags$li(tags$b("\"Compute Differential Peaks\""), " — runs the filtering and counting, then draws the bar chart."),
                 tags$li(tags$b("\"Download Plot\" / \"Download Data (Excel)\""), " — save the figure as PDF, or the underlying per-mark counts as Excel.")
               ),
@@ -1575,25 +1592,44 @@ server <- function(input, output, session) {
     unique(unlist(lapply(active_stages(), function(s) s$conditions)))
   })
 
-  # The user's chosen display order. Anything they've arranged comes first, in
-  # their order; any condition they removed from the box (or that appeared only
-  # after they set the order) is appended at the end so nothing silently
-  # vanishes from a plot.
+  # The user's chosen conditions, in their chosen order. This drives BOTH the
+  # display order and which conditions are used at all: a condition removed
+  # from the box is dropped from every plot, table and analysis in the app.
+  # Clearing the box entirely falls back to "all detected conditions" so the
+  # app is never left with nothing to plot.
   ordered_conditions <- reactive({
     all_conds <- detected_conditions()
     chosen    <- intersect(input$condition_order %||% character(0), all_conds)
-    c(chosen, setdiff(all_conds, chosen))
+    if (length(chosen) == 0) return(all_conds)
+    chosen
   })
+
+  # The conditions of one stage that survive the user's Condition/Life-cycle
+  # Order box, in that order. Falls back to the stage's own conditions if the
+  # kept set doesn't overlap this stage at all (e.g. Stage B has different
+  # condition names), so a stage is never silently reduced to nothing.
+  stage_conditions_kept <- function(st) {
+    kept <- intersect(ordered_conditions(), st$conditions)
+    if (length(kept) == 0) st$conditions else kept
+  }
 
   # Turn a data.frame's `condition` column into a factor with the user's chosen
   # level order, so ggplot legends, facet strips and DT tables all follow the
   # life cycle instead of sorting alphabetically.
   apply_condition_order <- function(df) {
     if (is.null(df) || !is.data.frame(df) || !"condition" %in% colnames(df)) return(df)
-    lv <- ordered_conditions()
-    lv <- c(intersect(lv, unique(as.character(df$condition))),
-            setdiff(unique(as.character(df$condition)), lv))
-    df$condition <- factor(as.character(df$condition), levels = lv)
+    keep     <- ordered_conditions()
+    cond_chr <- as.character(df$condition)
+    # Drop conditions the user removed from the order box. Guarded so that a
+    # data.frame whose `condition` column holds something unrelated (nothing
+    # matches) is passed through untouched rather than emptied.
+    if (any(cond_chr %in% keep)) {
+      df       <- df[cond_chr %in% keep, , drop = FALSE]
+      cond_chr <- as.character(df$condition)
+    }
+    lv <- c(intersect(keep, unique(cond_chr)),
+            setdiff(unique(cond_chr), keep))
+    df$condition <- factor(cond_chr, levels = lv)
     df
   }
 
@@ -1602,10 +1638,13 @@ server <- function(input, output, session) {
     if (length(conds) == 0) {
       return(tags$em(style = "color:#888", "Load a ChromstaR object to see its conditions here."))
     }
+    # `selected` is isolated: without it this renderUI would re-run on every
+    # edit of the box (via ordered_conditions()) and rebuild the widget with
+    # every condition selected again, so removals appeared to bounce back.
     selectizeInput(
       "condition_order", NULL,
       choices  = conds,
-      selected = ordered_conditions(),
+      selected = isolate(ordered_conditions()),
       multiple = TRUE,
       width    = "100%",
       options  = list(plugins = list("drag_drop", "remove_button"))
@@ -1987,7 +2026,7 @@ server <- function(input, output, session) {
           hmm        = st$hmm,
           genes_gr   = genes_sel,
           marks      = input$marks_enr,
-          conditions = st$conditions,
+          conditions = stage_conditions_kept(st),
           upstream   = input$enr_upstream,
           downstream = input$enr_downstream,
           n_bins     = input$enr_n_bins
@@ -2208,7 +2247,7 @@ server <- function(input, output, session) {
             hmm        = st$hmm,
             genes_gr   = genes_sel,
             marks      = input$marks_meta,
-            conditions = st$conditions,
+            conditions = stage_conditions_kept(st),
             mode       = m,
             upstream   = input$upstream,
             downstream = input$downstream,
@@ -2393,7 +2432,7 @@ server <- function(input, output, session) {
           hmm        = st$hmm,
           region_gr  = region_gr,
           marks      = marks_use,
-          conditions = st$conditions,
+          conditions = stage_conditions_kept(st),
           genes_gr   = rv$genes,
           bin_scope  = scope
         )
@@ -2628,9 +2667,10 @@ server <- function(input, output, session) {
     df$bin_id <- paste0(df$chr, ":", df$start, "-", df$end)
 
     rpkm_cols_all <- grep("counts.rpkm", colnames(bins_df), value = TRUE, fixed = TRUE)
-    # Emit the rpkm_<mark>_<condition> columns in the user's life-cycle order
-    conditions <- c(intersect(ordered_conditions(), conditions),
-                    setdiff(conditions, ordered_conditions()))
+    # Emit the rpkm_<mark>_<condition> columns in the user's life-cycle order,
+    # and only for the conditions they kept in the Condition/Life-cycle box.
+    kept <- intersect(ordered_conditions(), conditions)
+    if (length(kept) > 0) conditions <- kept
     for (cond in conditions) {
       for (mark in marks) {
         pattern <- paste0("counts.rpkm.", mark, ".", cond)
@@ -2655,7 +2695,7 @@ server <- function(input, output, session) {
     for (nm in stage_names) {
       st <- stages[[nm]]
       if (is.null(st) || is.null(annots[[nm]])) next
-      tdf <- build_stage_table(st$hmm, annots[[nm]], st$marks, st$conditions)
+      tdf <- build_stage_table(st$hmm, annots[[nm]], st$marks, stage_conditions_kept(st))
       if (!is.null(rv$hmm_b)) tdf$stage <- nm  # only add the column when a 2nd object is loaded at all
       tables[[nm]] <- tdf
     }
@@ -2699,152 +2739,252 @@ server <- function(input, output, session) {
   )
 
   # ---- DIFFERENTIAL PEAKS -----------------------------------------------------
-  #' For each mark, find bins where it's present in one condition's combination
-  #' but absent in the other, merge adjacent such bins into regions, and filter
-  #' by differential score and merged region width.
-  #' Replicates the exact "Galaxy-equivalent" pipeline from the user's Rmd:
-  #' uses hmm$segments (pre-merged chromatin segments, NOT raw 200bp bins),
-  #' filters by differential.score, combination inequality, and width, then
-  #' counts mark presence via simple grepl() on the string combination columns.
-  # ---- DIFFERENTIAL PEAKS (GENERIC VERSION) -----------------------------------
-  
-  compute_differential_peaks <- function(hmm, marks, score_thresh, width_thresh) {
-    
-    cat("\n--- compute_differential_peaks() called ---\n")
+  #' Generic, N-condition differential peak counting.
+  #'
+  #' Works on hmm$segments (the pre-merged chromatin segments, NOT the raw 200bp
+  #' bins). Segments are first filtered globally by differential.score and width;
+  #' then, for each requested PAIR of conditions, only the segments whose state
+  #' actually differs between those two conditions are kept, and for every mark
+  #' we count the segments carrying that mark in condition A but not B, and in B
+  #' but not A.
+  #'
+  #' The object may hold any number of conditions (2, 5, ...); `conds_sel` says
+  #' which ones to use and `mode` says how to pair them up:
+  #'   "pairwise"  — every combination of the selected conditions
+  #'   "reference" — every selected condition against `ref`
+  #'
+  #' Returns a long data.frame: comparison, mark, present_in, absent_in,
+  #' direction, n_regions, n_changed.
+
+  # A ChromstaR combination string looks like "[H3K4me3+H3K9ac]". Matching with a
+  # plain grepl() would let one mark name match inside another (e.g. H3K27me3 vs
+  # a hypothetical H3K27me); anchoring on the "[", "+" and "]" separators makes
+  # the test exact while staying vectorised (and therefore fast on 100k+ rows).
+  mark_in_combination <- function(x, mark) {
+    # escape every non-word character so a mark name is matched literally
+    m <- gsub("(\\W)", "\\\\\\1", mark, perl = TRUE)
+    grepl(paste0("(^|\\[|\\+)", m, "($|\\]|\\+)"), x, perl = TRUE)
+  }
+
+  compute_differential_peaks <- function(hmm, marks, score_thresh, width_thresh,
+                                         conds_sel = NULL, mode = "pairwise",
+                                         ref = NULL, stage_label = NULL) {
+
+    tag <- if (is.null(stage_label)) "" else paste0(" [", stage_label, "]")
+
+    cat("\n--- compute_differential_peaks()", tag, "---\n")
     cat("Object class:", paste(class(hmm), collapse = ", "), "\n")
     cat("Has $segments:", !is.null(hmm$segments), "\n")
-    
+
     if (is.null(hmm$segments)) {
       showNotification(
-        "hmm$segments not found — differential peaks requires merged segments.",
+        paste0("hmm$segments not found", tag,
+               " — differential peaks requires merged segments."),
         type = "error", duration = 10
       )
       return(NULL)
     }
-    
+
     segs_df <- as.data.frame(hmm$segments)
-    
+
     cat("Segments:", nrow(segs_df), "rows\n")
-    cat("Columns:", paste(colnames(segs_df), collapse = ", "), "\n")
-    
+
     # --------------------------------------------------------------------------
-    # Detect condition columns automatically
+    # Detect condition columns automatically — any number of them
     # --------------------------------------------------------------------------
     combination_cols <- grep("^combination\\.", colnames(segs_df), value = TRUE)
-    
-    if (length(combination_cols) != 2) {
+
+    if (length(combination_cols) < 2) {
       showNotification(
-        paste0(
-          "Expected exactly 2 conditions, found ",
-          length(combination_cols),
-          ": ",
-          paste(combination_cols, collapse = ", ")
-        ),
+        paste0("Need at least 2 conditions in the object", tag, ", found ",
+               length(combination_cols), "."),
         type = "error", duration = 12
       )
       return(NULL)
     }
-    
-    conditions <- sub("^combination\\.", "", combination_cols)
-    cond1 <- conditions[1]
-    cond2 <- conditions[2]
-    
-    cat("Conditions detected:", paste(conditions, collapse = ", "), "\n")
-    
+
+    all_conds <- sub("^combination\\.", "", combination_cols)
+    names(combination_cols) <- all_conds
+
+    cat("Conditions in object:", paste(all_conds, collapse = ", "), "\n")
+
+    conds <- if (is.null(conds_sel) || length(conds_sel) == 0) {
+      all_conds
+    } else {
+      intersect(conds_sel, all_conds)
+    }
+
+    if (length(conds) < 2) {
+      showNotification(
+        paste0("Select at least 2 conditions present in this object", tag,
+               ". Available: ", paste(all_conds, collapse = ", ")),
+        type = "error", duration = 12
+      )
+      return(NULL)
+    }
+
+    cat("Conditions used:", paste(conds, collapse = ", "), "| mode:", mode, "\n")
+
     # --------------------------------------------------------------------------
     # Required columns check
     # --------------------------------------------------------------------------
     required_cols <- c("differential.score", "width")
-    missing_cols <- setdiff(required_cols, colnames(segs_df))
-    
+    missing_cols  <- setdiff(required_cols, colnames(segs_df))
+
     if (length(missing_cols) > 0) {
       showNotification(
-        paste0("Missing columns: ", paste(missing_cols, collapse = ", ")),
+        paste0("Missing columns", tag, ": ", paste(missing_cols, collapse = ", ")),
         type = "error", duration = 12
       )
       return(NULL)
     }
-    
+
     # --------------------------------------------------------------------------
-    # Extract condition values
+    # Which pairs of conditions to compare
     # --------------------------------------------------------------------------
-    combo1 <- as.character(segs_df[[combination_cols[1]]])
-    combo2 <- as.character(segs_df[[combination_cols[2]]])
-    
+    pairs <- if (identical(mode, "reference")) {
+      r <- if (!is.null(ref) && ref %in% conds) ref else conds[1]
+      lapply(setdiff(conds, r), function(o) c(r, o))
+    } else {
+      utils::combn(conds, 2, simplify = FALSE)
+    }
+
     # --------------------------------------------------------------------------
-    # Filter segments
+    # Global filter (score + width), applied once for all pairs
     # --------------------------------------------------------------------------
-    filtered <- segs_df[
-      segs_df$differential.score >= score_thresh &
-        combo1 != combo2 &
-        segs_df$width >= width_thresh,
-    ]
-    
-    if (nrow(filtered) == 0) {
-      
+    keep <- segs_df$differential.score >= score_thresh & segs_df$width >= width_thresh
+    keep[is.na(keep)] <- FALSE
+
+    if (!any(keep)) {
       score_range <- paste0(
-        round(min(segs_df$differential.score, na.rm = TRUE), 4),
-        " to ",
+        round(min(segs_df$differential.score, na.rm = TRUE), 4), " to ",
         round(max(segs_df$differential.score, na.rm = TRUE), 4)
       )
-      
       showNotification(
-        paste0(
-          "No segments passed filters (score≥", score_thresh,
-          ", width≥", width_thresh, "). Range: ", score_range
-        ),
+        paste0("No segments passed the filters", tag, " (score>=", score_thresh,
+               ", width>=", width_thresh, "). Score range in this object: ", score_range),
         type = "warning", duration = 12
       )
-      
       return(NULL)
     }
-    
-    f1 <- as.character(filtered[[combination_cols[1]]])
-    f2 <- as.character(filtered[[combination_cols[2]]])
-    
+
+    kept <- segs_df[keep, , drop = FALSE]
+    cat("Segments passing score/width:", nrow(kept), "\n")
+
     # --------------------------------------------------------------------------
-    # Count differential regions per mark
+    # Per pair: keep segments whose state differs between those two conditions,
+    # then count mark presence in each direction
     # --------------------------------------------------------------------------
-    results <- lapply(marks, function(m) {
-      
-      cond1_not_cond2 <- sum(
-        grepl(m, f1, fixed = TRUE) &
-          !grepl(m, f2, fixed = TRUE)
+    results <- list()
+
+    for (pr in pairs) {
+      a <- pr[1]
+      b <- pr[2]
+
+      combo_a <- as.character(kept[[combination_cols[[a]]]])
+      combo_b <- as.character(kept[[combination_cols[[b]]]])
+
+      changed <- which(combo_a != combo_b)
+      cat("  ", a, "vs", b, "— segments changing state:", length(changed), "\n")
+
+      if (length(changed) == 0) next
+
+      fa <- combo_a[changed]
+      fb <- combo_b[changed]
+
+      for (m in marks) {
+        in_a <- mark_in_combination(fa, m)
+        in_b <- mark_in_combination(fb, m)
+
+        results[[length(results) + 1L]] <- data.frame(
+          comparison = paste0(a, " vs ", b),
+          mark       = m,
+          present_in = c(a, b),
+          absent_in  = c(b, a),
+          direction  = c(paste0(a, "-not-", b), paste0(b, "-not-", a)),
+          n_regions  = c(sum(in_a & !in_b), sum(!in_a & in_b)),
+          n_changed  = length(changed),
+          stringsAsFactors = FALSE
+        )
+      }
+    }
+
+    if (length(results) == 0) {
+      showNotification(
+        paste0("No segments changed chromatin state between the selected conditions",
+               tag, " at these thresholds. Try lowering the score or width filter."),
+        type = "warning", duration = 12
       )
-      
-      cond2_not_cond1 <- sum(
-        !grepl(m, f1, fixed = TRUE) &
-          grepl(m, f2, fixed = TRUE)
-      )
-      
-      data.frame(
-        mark = rep(m, 2),
-        direction = c(
-          paste0(cond1, "-not-", cond2),
-          paste0(cond2, "-not-", cond1)
-        ),
-        n_regions = c(cond1_not_cond2, cond2_not_cond1),
-        stringsAsFactors = FALSE
-      )
-    })
-    
+      return(NULL)
+    }
+
     out <- dplyr::bind_rows(results)
-    
-    attr(out, "total_filtered") <- nrow(filtered)
-    attr(out, "conditions") <- conditions
-    
+
+    attr(out, "total_filtered") <- nrow(kept)
+    attr(out, "conditions")     <- conds
+
     out
   }
-  
+
+  # ------------------------------------------------------------------------------
+  # Condition / reference pickers for this tab
+  # ------------------------------------------------------------------------------
+
+  # Conditions available on this tab = those present in the selected stage(s),
+  # restricted to (and ordered by) the user's life-cycle order from the Load tab.
+  diff_available_conditions <- reactive({
+    stages      <- active_stages()
+    stage_names <- resolve_selected_stages(input$stages_diffpeaks)
+    conds <- unique(unlist(lapply(stage_names, function(nm) stages[[nm]]$conditions)))
+    conds <- conds[!is.na(conds)]
+    ord   <- ordered_conditions()
+    c(intersect(ord, conds), setdiff(conds, ord))
+  })
+
+  output$diff_condition_ui <- renderUI({
+    conds <- diff_available_conditions()
+    if (length(conds) == 0) {
+      return(tags$em(style = "color:#888",
+                     "Load a ChromstaR object to choose conditions."))
+    }
+    prev <- intersect(isolate(input$diff_conditions) %||% character(0), conds)
+    sel  <- if (length(prev) >= 2) prev else utils::head(conds, min(5L, length(conds)))
+    selectizeInput(
+      "diff_conditions", NULL,
+      choices  = conds,
+      selected = sel,
+      multiple = TRUE,
+      width    = "100%",
+      options  = list(maxItems = 5, plugins = list("drag_drop", "remove_button"))
+    )
+  })
+
+  output$diff_ref_ui <- renderUI({
+    sel <- intersect(input$diff_conditions %||% character(0), diff_available_conditions())
+    if (length(sel) < 2) return(NULL)
+    selectInput("diff_ref", "Reference condition",
+                choices = sel, selected = sel[1], width = "100%")
+  })
+
   # ------------------------------------------------------------------------------
   # Reactive: compute differential peaks
   # ------------------------------------------------------------------------------
-  
+
   diffpeaks_data <- eventReactive(input$run_diffpeaks, {
 
     req(rv$hmm, rv$marks)
 
     stage_names <- resolve_selected_stages(input$stages_diffpeaks)
+    conds_sel   <- intersect(input$diff_conditions %||% character(0),
+                             diff_available_conditions())
+    mode        <- input$diff_mode %||% "pairwise"
+    ref         <- input$diff_ref
+
+    if (length(conds_sel) < 2) {
+      showNotification("Pick at least 2 conditions to compare.",
+                       type = "error", duration = 8)
+      return(NULL)
+    }
 
     tryCatch({
 
@@ -2855,14 +2995,17 @@ server <- function(input, output, session) {
             hmm          = st$hmm,
             marks        = st$marks,
             score_thresh = input$diff_score_thresh,
-            width_thresh = input$diff_width_thresh
+            width_thresh = input$diff_width_thresh,
+            conds_sel    = conds_sel,
+            mode         = mode,
+            ref          = ref
           )
           if (is.null(df)) return(NULL)
           # attr()s don't survive bind_rows() across stages, so carry the
-          # per-stage bookkeeping (total filtered segments, which two
-          # conditions this stage compares) as ordinary columns instead.
+          # per-stage bookkeeping (total filtered segments, which conditions
+          # this stage actually contributed) as ordinary columns instead.
           df$total_filtered   <- attr(df, "total_filtered")
-          df$stage_conditions <- paste(attr(df, "conditions"), collapse = " vs ")
+          df$stage_conditions <- paste(attr(df, "conditions"), collapse = ", ")
           df
         })
 
@@ -2878,19 +3021,19 @@ server <- function(input, output, session) {
       NULL
     })
   })
-  
+
   # ------------------------------------------------------------------------------
   # Plot builder
   # ------------------------------------------------------------------------------
-  
-  build_diffpeaks_plot <- reactive({
 
+  # Shared prep so the plot and the sizing logic agree on facet counts.
+  diffpeaks_prepared <- reactive({
     df <- diffpeaks_data()
     req(df)
 
-    multi_stage <- "stage" %in% colnames(df) && length(unique(df$stage)) > 1
+    ord <- ordered_conditions()
 
-    # order marks (globally, across whichever stage(s) are shown)
+    # marks ordered by total number of differential regions (biggest at top)
     mark_order <- df %>%
       dplyr::group_by(mark) %>%
       dplyr::summarise(total = sum(n_regions), .groups = "drop") %>%
@@ -2899,80 +3042,117 @@ server <- function(input, output, session) {
 
     df$mark <- factor(df$mark, levels = rev(mark_order))
 
-    # dynamic colors (works for any number/combination of directions, since
-    # each stage contributes its own two "condA-not-condB" / "condB-not-condA"
-    # categories and those can differ in name from stage to stage).
-    # Directions are ordered by where their leading condition sits in the
-    # user's life-cycle order, so the legend follows the same logic as
-    # everywhere else in the app.
-    dirs     <- unique(as.character(df$direction))
-    dir_rank <- vapply(dirs, function(d) {
-      pos <- match(sub("-not-.*$", "", d), ordered_conditions())
-      if (is.na(pos)) Inf else as.numeric(pos)
-    }, numeric(1))
-    dirs <- dirs[order(dir_rank, dirs)]
-    df$direction <- factor(as.character(df$direction), levels = dirs)
+    # Bars are coloured by the condition the mark is present in, so the colours
+    # match the rest of the app no matter how many pairs are on screen.
+    pres <- unique(as.character(df$present_in))
+    lv   <- c(intersect(ord, pres), setdiff(pres, ord))
+    df$present_in <- factor(as.character(df$present_in), levels = lv)
 
-    fill_cols <- setNames(
-      colorRampPalette(c("#d6604d", "#4393c3", "#8e44ad", "#27ae60"))(length(dirs)),
-      dirs
+    # Facets follow the life-cycle order of the first, then second condition.
+    comps <- unique(as.character(df$comparison))
+    r1 <- match(sub(" vs .*$", "", comps), ord)
+    r2 <- match(sub("^.* vs ", "", comps), ord)
+    r1[is.na(r1)] <- length(ord) + 1L
+    r2[is.na(r2)] <- length(ord) + 1L
+    comps <- comps[order(r1, r2, comps)]
+    df$comparison <- factor(as.character(df$comparison), levels = comps)
+
+    list(
+      df          = df,
+      n_comps     = length(comps),
+      multi_stage = "stage" %in% colnames(df) && length(unique(df$stage)) > 1,
+      n_stages    = if ("stage" %in% colnames(df)) length(unique(df$stage)) else 1L,
+      levels      = lv
     )
+  })
 
-    subtitle_txt <- if (multi_stage) {
-      info <- df %>% dplyr::distinct(stage, stage_conditions, total_filtered)
-      paste0(
-        paste0(info$stage, " (", info$stage_conditions, ", n=",
-              format(info$total_filtered, big.mark = ","), ")", collapse = "   |   "),
-        "\nscore≥", input$diff_score_thresh, ", width≥", input$diff_width_thresh, "bp"
-      )
+  build_diffpeaks_plot <- reactive({
+
+    prep <- diffpeaks_prepared()
+    df   <- prep$df
+
+    fill_cols <- condition_palette()[prep$levels]
+    names(fill_cols) <- prep$levels
+    fill_cols[is.na(fill_cols)] <- "#9E9E9E"
+
+    info <- df %>% dplyr::distinct(stage, stage_conditions, total_filtered)
+    mode_txt <- if (identical(input$diff_mode, "reference")) {
+      paste0("reference = ", input$diff_ref)
     } else {
-      paste0(
-        unique(df$stage_conditions)[1],
-        " | score≥", input$diff_score_thresh,
-        ", width≥", input$diff_width_thresh,
-        "bp | Total=", format(unique(df$total_filtered)[1], big.mark = ",")
-      )
+      "all pairwise"
     }
 
-    p <- ggplot(df, aes(x = mark, y = n_regions, fill = direction)) +
+    subtitle_txt <- paste0(
+      paste0(info$stage, " (", info$stage_conditions, ", ",
+             format(info$total_filtered, big.mark = ","),
+             " segments pass filters)", collapse = "   |   "),
+      "\nscore>=", input$diff_score_thresh,
+      ", width>=", input$diff_width_thresh, "bp | ", mode_txt
+    )
+
+    p <- ggplot(df, aes(x = mark, y = n_regions, fill = present_in)) +
       geom_col(position = position_dodge(width = 0.8), width = 0.7) +
       coord_flip() +
-      scale_fill_manual(values = fill_cols) +
+      scale_fill_manual(values = fill_cols, drop = FALSE) +
       labs(
         x = "Histone Mark",
         y = "Number of Regions",
-        fill = NULL,
-        title = "Pairwise Differential Peaks per Histone Mark",
+        fill = "Mark present in",
+        title = "Differential Peaks per Histone Mark",
         subtitle = subtitle_txt
       ) +
       theme_bw(base_size = 13) +
       theme(
         legend.position = "top",
-        panel.grid.minor = element_blank()
+        panel.grid.minor = element_blank(),
+        strip.text = element_text(face = "bold")
       )
 
-    if (multi_stage) p <- p + facet_wrap(~ stage, ncol = 1)
+    if (prep$multi_stage) {
+      p <- p + facet_grid(stage ~ comparison)
+    } else {
+      p <- p + facet_wrap(~ comparison, ncol = min(3L, max(1L, prep$n_comps)))
+    }
 
     p
   })
-  
+
+  # With up to 10 pairwise panels (5 conditions) a fixed 550px is unreadable,
+  # so the canvas grows with the number of facet rows.
+  diffpeaks_plot_height <- reactive({
+    prep <- diffpeaks_prepared()
+    if (prep$multi_stage) {
+      max(450L, as.integer(300 * prep$n_stages) + 120L)
+    } else {
+      rows <- ceiling(prep$n_comps / min(3L, max(1L, prep$n_comps)))
+      max(550L, as.integer(300 * rows) + 120L)
+    }
+  })
+
   # ------------------------------------------------------------------------------
   # Outputs
   # ------------------------------------------------------------------------------
-  
+
+  output$diffpeaks_plot_container <- renderUI({
+    h <- tryCatch(diffpeaks_plot_height(), error = function(e) 550L)
+    plotOutput("diffpeaks_plot", height = paste0(h, "px"))
+  })
+
   output$diffpeaks_plot <- renderPlot({
     build_diffpeaks_plot()
   })
-  
+
   output$dl_diffpeaks_plot <- downloadHandler(
     filename = function() {
       paste0("differential_peaks_", Sys.Date(), ".pdf")
     },
     content = function(file) {
-      ggsave(file, build_diffpeaks_plot(), width = 10, height = 7, device = "pdf")
+      h <- tryCatch(diffpeaks_plot_height() / 70, error = function(e) 7)
+      ggsave(file, build_diffpeaks_plot(),
+             width = 12, height = max(7, min(30, h)), device = "pdf", limitsize = FALSE)
     }
   )
-  
+
   output$dl_diffpeaks_xlsx <- downloadHandler(
     filename = function() {
       paste0("differential_peaks_data_", Sys.Date(), ".xlsx")
