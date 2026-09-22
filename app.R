@@ -37,6 +37,338 @@ library(GenomicFeatures)
 # library(Gviz)  # loaded conditionally below
 
 # =============================================================================
+# BUILD STAMP + MASKING GUARD
+# =============================================================================
+# randomForest (and a few other packages) export their own margin(). Attached
+# after ggplot2 it wins the search path, so a bare margin() call resolves to
+# randomForest::margin(x, observed, ...) and fails with:
+#     argument "observed" is missing, with no default
+# Every margin() call in this file is already written as ggplot2::margin().
+# This binding is belt-and-braces in case a bare one is ever reintroduced.
+margin <- ggplot2::margin
+
+APP_BUILD <- "2026-09-21f / per-condition colour pickers"
+message("---------------------------------------------------------------")
+message("ChromstaR Viewer build: ", APP_BUILD)
+message("margin() resolves to: ", environmentName(environment(margin)),
+        "   (must be 'ggplot2')")
+message("---------------------------------------------------------------")
+
+# =============================================================================
+# PLOT CUSTOMIZATION HELPER FUNCTIONS (NEW - ADD TEXT & STYLING CONTROLS)
+# =============================================================================
+
+#' Create a customizable theme based on user-selected text sizes and styling
+build_custom_theme <- function(
+    base_size = 13,
+    title_size = 14,
+    axis_title_size = 12,
+    axis_text_size = 10,
+    legend_title_size = 11,
+    legend_text_size = 10,
+    strip_text_size = 11,
+    line_width = 0.8) {
+  
+  list(
+    theme_bw(base_size = base_size),
+    theme(
+      plot.title = element_text(size = title_size, face = "bold", hjust = 0.5, margin = ggplot2::margin(b = 8)),
+      plot.subtitle = element_text(size = axis_title_size - 1, hjust = 0.5, margin = ggplot2::margin(b = 8)),
+      axis.title.x = element_text(size = axis_title_size, face = "bold", margin = ggplot2::margin(t = 10)),
+      axis.title.y = element_text(size = axis_title_size, face = "bold", margin = ggplot2::margin(r = 10)),
+      axis.text.x = element_text(size = axis_text_size, angle = 45, hjust = 1),
+      axis.text.y = element_text(size = axis_text_size),
+      legend.title = element_text(size = legend_title_size, face = "bold"),
+      legend.text = element_text(size = legend_text_size),
+      strip.text = element_text(size = strip_text_size, colour = "white", face = "bold"),
+      strip.background = element_rect(fill = "#34495e"),
+      panel.grid.minor = element_blank(),
+      plot.margin = ggplot2::margin(10, 10, 10, 10)
+    )
+  )
+}
+
+#' Apply one tab's "Plot Appearance" slider settings to a finished ggplot.
+#' Text sizes and gridlines are layered on with theme(); line width, point size
+#' and transparency are geom-level parameters, so they are written directly into
+#' the plot's existing layers. `prefix` selects which tab's sliders to read,
+#' e.g. "mg_" for the metagene tab.
+apply_plot_customization <- function(p, input, prefix = "") {
+  if (is.null(p) || !inherits(p, "ggplot")) return(p)
+
+  gv <- function(suffix, default) {
+    v <- input[[paste0(prefix, suffix)]]
+    if (is.null(v) || length(v) != 1) return(default)
+    if (is.numeric(v) && !is.finite(v)) return(default)
+    v
+  }
+  title_size      <- gv("plot_title_size",      14)
+  axis_title_size <- gv("plot_axis_title_size", 12)
+  axis_text_size  <- gv("plot_axis_text_size",  10)
+  legend_size     <- gv("plot_legend_size",     10)
+  line_width      <- gv("plot_line_width",     0.8)
+  point_size      <- gv("plot_point_size",       2)
+  alpha_val       <- gv("plot_alpha",          0.2)
+  show_grid       <- gv("plot_show_grid",     TRUE)
+
+  # --- geom-level settings: these cannot be reached through theme() ---
+  lw_arg <- if (utils::packageVersion("ggplot2") >= "3.4.0") "linewidth" else "size"
+  for (i in seq_along(p$layers)) {
+    g <- class(p$layers[[i]]$geom)[1]
+    if (g %in% c("GeomLine", "GeomPath", "GeomStep", "GeomSmooth", "GeomSegment")) {
+      p$layers[[i]]$aes_params[[lw_arg]] <- line_width
+    }
+    if (g %in% c("GeomPoint", "GeomJitter")) {
+      p$layers[[i]]$aes_params$size <- point_size
+    }
+    # only shaded bands - deliberately NOT tiles/rects, so heatmaps stay readable
+    if (g %in% c("GeomRibbon", "GeomArea")) {
+      p$layers[[i]]$aes_params$alpha <- alpha_val
+    }
+  }
+
+  # --- text sizes: preserve any x-axis label rotation the plot already set ---
+  ang <- p$theme$axis.text.x$angle
+  hj  <- p$theme$axis.text.x$hjust
+  p <- p + ggplot2::theme(
+    plot.title   = ggplot2::element_text(size = title_size, face = "bold", hjust = 0.5),
+    axis.title.x = ggplot2::element_text(size = axis_title_size, face = "bold"),
+    axis.title.y = ggplot2::element_text(size = axis_title_size, face = "bold"),
+    axis.text.x  = ggplot2::element_text(size = axis_text_size, angle = ang, hjust = hj),
+    axis.text.y  = ggplot2::element_text(size = axis_text_size),
+    legend.text  = ggplot2::element_text(size = legend_size),
+    legend.title = ggplot2::element_text(size = legend_size + 1, face = "bold")
+  )
+
+  if (!isTRUE(show_grid)) {
+    p <- p + ggplot2::theme(panel.grid.major = ggplot2::element_blank(),
+                            panel.grid.minor = ggplot2::element_blank())
+  }
+  p
+}
+
+#' Run `expr` and, if it fails, print a full call stack to the R console and
+#' surface the innermost failing calls in the UI message. Used to pin down
+#' errors that come from a function masked by another attached package.
+with_stack_trace <- function(expr, label = "") {
+  trace_rows <- NULL
+  tryCatch(
+    withCallingHandlers(
+      expr,
+      error = function(e) {
+        skip <- c(".handleSimpleError", "h", "stop", "signalCondition", "try",
+                  "tryCatch", "tryCatchList", "tryCatchOne", "doTryCatch",
+                  "withCallingHandlers", "with_stack_trace",
+                  "..stacktraceon..", "..stacktraceoff..")
+        rows <- character(0)
+        for (i in seq_len(sys.nframe())) {
+          cl <- tryCatch(sys.call(i), error = function(...) NULL)
+          if (is.null(cl) || !is.call(cl)) next
+          hd <- tryCatch(paste(deparse(cl[[1]]), collapse = ""),
+                         error = function(...) "?")
+          if (grepl("^function", hd)) next        # anonymous handler frames
+          if (hd %in% skip) next
+          fn  <- tryCatch(sys.function(i), error = function(...) NULL)
+          env <- if (is.function(fn))
+                   tryCatch(environmentName(environment(fn)),
+                            error = function(...) "") else ""
+          txt <- substr(paste(deparse(cl), collapse = " "), 1, 110)
+          rows <- c(rows, paste0(txt, if (nzchar(env)) paste0("   <", env, ">") else ""))
+        }
+        trace_rows <<- rows
+      }
+    ),
+    error = function(e) {
+      message("\n=== ChromstaR Viewer traceback (", label, ") ===")
+      message(conditionMessage(e))
+      if (!is.null(trace_rows))
+        message(paste(sprintf("%2d. %s", seq_along(trace_rows), trace_rows),
+                      collapse = "\n"))
+      message("=== end traceback ===\n")
+      hint <- if (!is.null(trace_rows))
+                paste(sprintf("%d) %s", seq_along(utils::tail(trace_rows, 8)),
+                              utils::tail(trace_rows, 8)), collapse = "    ")
+              else ""
+      stop(paste0(conditionMessage(e),
+                  "   ||  FAILING CALLS (innermost last, <package> in angle brackets):  ",
+                  hint, "  ||  (full traceback also printed to the R console)"),
+           call. = FALSE)
+    }
+  )
+}
+
+#' Per-mark domain counts from a chromstaR $frequencies table (genome-wide,
+#' unfiltered). Mirrors the "Genome-wide Domain-Level Analysis" section of the
+#' reference Rmd: for each mark, sum the `domains` column over the combination
+#' pairs where that mark is present in one condition and absent in the other.
+#' `cond_b` is the "second" condition, so gained = present in cond_b only.
+compute_mark_ranking_freq <- function(freq_df, marks, cond_a, cond_b) {
+  if (is.null(freq_df)) return(NULL)
+  freq_df <- as.data.frame(freq_df)
+  col_a <- paste0("combination.", cond_a)
+  col_b <- paste0("combination.", cond_b)
+  if (!all(c(col_a, col_b, "domains") %in% colnames(freq_df))) return(NULL)
+
+  ca <- as.character(freq_df[[col_a]])
+  cb <- as.character(freq_df[[col_b]])
+  dm <- suppressWarnings(as.numeric(freq_df$domains))
+  total <- sum(dm, na.rm = TRUE)
+  if (!is.finite(total) || total <= 0) return(NULL)
+
+  out <- do.call(rbind, lapply(marks, function(m) {
+    in_a <- grepl(m, ca, fixed = TRUE)
+    in_b <- grepl(m, cb, fixed = TRUE)
+    gained <- sum(dm[!in_a &  in_b], na.rm = TRUE)   # present in cond_b only
+    lost   <- sum(dm[ in_a & !in_b], na.rm = TRUE)   # present in cond_a only
+    data.frame(mark          = m,
+               gained        = gained,
+               lost          = lost,
+               constant      = sum(dm[in_a & in_b], na.rm = TRUE),
+               total_changed = gained + lost,
+               stringsAsFactors = FALSE)
+  }))
+  out$total_domains <- total
+  out$pct_changed   <- round(out$total_changed / total * 100, 2)
+  out$pct_gained    <- round(out$gained        / total * 100, 2)
+  out$pct_lost      <- round(out$lost          / total * 100, 2)
+  out$net           <- out$gained - out$lost
+  out$cond_a        <- cond_a
+  out$cond_b        <- cond_b
+  out$direction     <- ifelse(out$net > 0, paste0("Gained in ", cond_b),
+                                           paste0("Lost in ",   cond_b))
+  out <- out[order(-out$total_changed), ]
+  rownames(out) <- NULL
+  out
+}
+
+#' Shared horizontal ranked-bar chart for the two "marks ranked by change"
+#' figures. `rank_df` needs: mark, total_changed, pct_changed, direction — and
+#' optionally `panel`, which facets when it has more than one level. Marks are
+#' ordered by total change summed across panels so the ordering is comparable.
+mark_ranking_ggplot <- function(rank_df, title, subtitle,
+                                ylab  = "Total Domains Changed",
+                                style = "stacked",
+                                cond_colors = NULL) {
+  if (is.null(rank_df) || nrow(rank_df) == 0) return(NULL)
+  if (!"panel" %in% colnames(rank_df)) rank_df$panel <- ""
+
+  # Marks ordered by total change, summed across panels so the order is shared.
+  ord <- stats::aggregate(total_changed ~ mark, data = rank_df, FUN = sum)
+  ord <- ord[order(ord$total_changed), ]
+  lev <- as.character(ord$mark)
+
+  # One row per mark PER DIRECTION, so the bar is never a single colour
+  # standing for a total that mixes gains and losses.
+  long <- rbind(
+    data.frame(mark  = as.character(rank_df$mark),
+               panel = rank_df$panel,
+               part  = paste0("Gained in ", rank_df$cond_b),
+               cond  = as.character(rank_df$cond_b),   # mark present in cond_b
+               n     = rank_df$gained,
+               pct   = rank_df$pct_gained,
+               stringsAsFactors = FALSE),
+    data.frame(mark  = as.character(rank_df$mark),
+               panel = rank_df$panel,
+               part  = paste0("Lost in ", rank_df$cond_b),
+               cond  = as.character(rank_df$cond_a),   # mark present in cond_a
+               n     = rank_df$lost,
+               pct   = rank_df$pct_lost,
+               stringsAsFactors = FALSE))
+  long$mark <- factor(long$mark, levels = lev)
+
+  # Each half of the bar is "the mark is present in THIS condition", so it is
+  # coloured with that condition's colour — the same one every other figure
+  # in the app uses. Falls back to the red/blue default when none is set.
+  key  <- unique(long[, c("part", "cond")])
+  cols <- stats::setNames(vapply(seq_len(nrow(key)), function(i) {
+    cn <- key$cond[i]
+    if (!is.null(cond_colors) && !is.na(cn) && cn %in% names(cond_colors)) {
+      unname(cond_colors[[cn]])
+    } else if (grepl("^Gained", key$part[i])) "#d6604d" else "#4393c3"
+  }, character(1)), key$part)
+  lv <- key$part
+  long$part <- factor(long$part, levels = lv)
+
+  tot <- rank_df
+  tot$mark <- factor(as.character(tot$mark), levels = lev)
+
+  if (identical(style, "diverging")) {
+    # Losses left of zero, gains right of zero: direction is unmistakable and
+    # no number on the chart stands for a mixture of the two.
+    long$n_signed <- ifelse(grepl("^Lost", as.character(long$part)), -long$n, long$n)
+    p <- ggplot(long, aes(x = mark, y = n_signed, fill = part)) +
+      geom_col() +
+      geom_hline(yintercept = 0, linewidth = 0.4, colour = "grey30") +
+      geom_text(aes(label = ifelse(n == 0, "",
+                                   paste0(formatC(pct, format = "f", digits = 2), "%")),
+                    hjust = ifelse(n_signed < 0, 1.12, -0.12)),
+                size = 3.1) +
+      scale_y_continuous(labels = function(v) scales::comma(abs(v)),
+                         expand = expansion(mult = c(0.18, 0.18)))
+    ylab_use <- paste0(ylab, "   (left = lost, right = gained)")
+  } else {
+    # Stacked: total bar length still ranks the marks, but the gained and lost
+    # parts are drawn separately. The label is the combined percentage.
+    p <- ggplot(long, aes(x = mark, y = n, fill = part)) +
+      geom_col() +
+      geom_text(data = tot,
+                aes(x = mark, y = total_changed,
+                    label = paste0(formatC(pct_changed, format = "f", digits = 2), "%")),
+                inherit.aes = FALSE, hjust = -0.12, size = 3.4) +
+      scale_y_continuous(labels = scales::comma,
+                         expand = expansion(mult = c(0, 0.18)))
+    ylab_use <- paste0(ylab, "   (bar = gained + lost)")
+  }
+
+  p <- p +
+    coord_flip(clip = "off") +
+    scale_fill_manual(values = cols) +
+    labs(title = title, subtitle = subtitle,
+         x = "Histone Mark", y = ylab_use, fill = "") +
+    theme_bw(base_size = 13) +
+    theme(legend.position = "top")
+
+  if (length(unique(rank_df$panel)) > 1) p <- p + facet_wrap(~ panel, scales = "free_x")
+  p
+}
+
+#' Stable, syntactically safe Shiny input id for a condition name.
+cond_colour_id <- function(cond) paste0("cond_col_", gsub("[^A-Za-z0-9]", "_", cond))
+
+#' A colour picker that needs no extra package: a standard Shiny text input
+#' switched to the browser's native <input type="color">. Shiny still reads it
+#' as a character value like "#1f77b4", so it works like any other input.
+condition_colour_input <- function(inputId, label, value) {
+  ti <- shiny::textInput(inputId, label, value = value)
+  for (i in seq_along(ti$children)) {
+    ch <- ti$children[[i]]
+    if (!is.null(ch) && !is.null(ch$name) && identical(ch$name, "input")) {
+      ti$children[[i]]$attribs$type  <- "color"
+      ti$children[[i]]$attribs$style <- "width:66px; height:36px; padding:2px; cursor:pointer;"
+    }
+  }
+  ti
+}
+
+#' Get condition colors
+get_condition_colors <- function(conditions) {
+  color_palette <- c(
+    "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728",
+    "#9467bd", "#8c564b", "#e377c2", "#7f7f7f",
+    "#bcbd22", "#17becf"
+  )
+  stats::setNames(color_palette[1:length(conditions)], conditions)
+}
+
+#' Get condition line types
+get_condition_linetypes <- function(conditions) {
+  ltypes <- c("solid", "dashed", "dotted", "dotdash", "longdash", "twodash")
+  stats::setNames(ltypes[1:length(conditions)], conditions)
+}
+
+
+
+# =============================================================================
 # HELPER FUNCTIONS
 # =============================================================================
 
@@ -72,7 +404,9 @@ load_chromstar_object <- function(path) {
   #   segments -> merged chromatin segments (Differential Peaks tab)
   #   info     -> mark / condition metadata (Load Data detection)
   #   hmms     -> fallback for mark/condition detection on some object types
-  needed <- c("bins", "segments", "info", "hmms")
+  #   frequencies -> per-combination domain counts, used by the genome-wide
+  #                  "marks ranked by change" figure on the Differential Peaks tab
+  needed <- c("bins", "segments", "info", "hmms", "frequencies")
   slim   <- list()
   for (slot in needed) {
     val <- tryCatch(obj[[slot]], error = function(e) NULL)
@@ -166,10 +500,22 @@ extract_signal_region <- function(hmm, region_gr, marks, conditions,
 #' Compute log(observed/expected) enrichment profile around gene boundaries
 #' Mirrors the reference figure: x-axis spans upstream-of-TSS -> gene body (%) -> downstream-of-TES
 #' "Observed" = mean RPKM in each bin; "Expected" = genome-wide mean RPKM for that mark/condition
+#' `ratio_mode` decides HOW log(observed/expected) is formed:
+#'   "means"  — (default, and what the Galaxy chromstaR profile does) average the
+#'              raw signal of every bin in a slot, zero bins included, then take
+#'              one log ratio of that mean against the genome-wide mean:
+#'                  log( mean(signal in slot) / mean(signal genome-wide) )
+#'   "legacy" — take log(signal/expected) for each bin separately and average the
+#'              logs. That is a geometric mean, so bins with zero signal have to
+#'              be discarded (log(0) is undefined). Discarding them biases every
+#'              slot upward, and the bias is largest exactly where a mark is
+#'              genuinely ABSENT (that is where most bins are zero) — so real
+#'              depletion is flattened away. Kept only to reproduce old figures.
 compute_enrichment_profile <- function(hmm, genes_gr, marks, conditions,
                                        upstream   = 2000,
                                        downstream = 2000,
-                                       n_bins     = 40) {
+                                       n_bins     = 40,
+                                       ratio_mode = "means") {
 
   bins    <- hmm$bins
   bins_df <- expand_bins_df(hmm)
@@ -189,7 +535,11 @@ compute_enrichment_profile <- function(hmm, genes_gr, marks, conditions,
       vals <- rowMeans(bins_df[, cols, drop = FALSE], na.rm = TRUE)
       key  <- paste(cond, mark)
       signal_mat[[key]] <- vals
-      expected[[key]]   <- mean(vals, na.rm = TRUE)
+      expected[[key]]   <- if (identical(ratio_mode, "legacy")) {
+        mean(vals[vals > 0], na.rm = TRUE)
+      } else {
+        mean(vals, na.rm = TRUE)   # zero bins belong in the baseline
+      }
     }
   }
 
@@ -226,6 +576,7 @@ compute_enrichment_profile <- function(hmm, genes_gr, marks, conditions,
 
   # ---- 3 findOverlaps calls total (not 3 * n_genes) --------------------------
   all_profiles <- list()
+  gene_slots   <- list()
 
   for (zname in names(zone_gr)) {
     zr <- zone_gr[[zname]]
@@ -258,7 +609,22 @@ compute_enrichment_profile <- function(hmm, genes_gr, marks, conditions,
       x_val <- 1 + frac
     }
 
+    # A 200-250bp bin can overlap a zone while its midpoint sits outside it.
+    # Those rows produced fractions slightly below 0 or above 1, i.e. slots
+    # beyond the intended [-1, 2] axis (x = 2.025, 2.05 ...) that the plot then
+    # clipped but the Excel export still carried, each averaged over a handful
+    # of bins. Drop them at source instead.
+    keep  <- !is.na(frac) & frac >= 0 & frac <= 1
+    bi    <- bi[keep]
+    g_i   <- g_i[keep]
+    x_val <- x_val[keep]
+    if (length(bi) == 0) next
+
     slot_idx <- round(x_val * n_bins)
+
+    # Which genes land in which slot depends only on geometry, not on the mark
+    # or condition, so record it once here and join it on at the end.
+    gene_slots[[zname]] <- data.frame(slot = slot_idx, gene_idx = g_i)
 
     for (cond in conditions) {
       for (mark in marks) {
@@ -269,12 +635,19 @@ compute_enrichment_profile <- function(hmm, genes_gr, marks, conditions,
         if (is.na(exp_val) || exp_val <= 0) next
 
         sig <- sig_vec[bi]
-        sig[sig <= 0] <- NA  # avoid log(0)
+
+        if (identical(ratio_mode, "legacy")) {
+          sig[sig <= 0] <- NA          # a geometric mean cannot take log(0)
+          val <- log(sig / exp_val)
+        } else {
+          val <- sig                   # keep raw signal; the log is taken after
+        }                              # averaging, in the summarise() below
 
         prof_key <- paste(cond, mark, zname)
         all_profiles[[prof_key]] <- data.frame(
           slot      = slot_idx,
-          log_ratio = log(sig / exp_val),
+          value     = val,
+          expected  = exp_val,
           mark      = mark,
           condition = cond,
           stringsAsFactors = FALSE
@@ -285,14 +658,62 @@ compute_enrichment_profile <- function(hmm, genes_gr, marks, conditions,
 
   if (length(all_profiles) == 0) return(NULL)
 
-  bind_rows(all_profiles) %>%
+  out <- bind_rows(all_profiles) %>%
     group_by(slot, mark, condition) %>%
     summarise(
-      mean_log_ratio = mean(log_ratio, na.rm = TRUE),
-      n_genes        = n(),
-      .groups        = "drop"
-    ) %>%
-    filter(is.finite(mean_log_ratio))
+      mean_value = mean(value, na.rm = TRUE),
+      expected   = dplyr::first(expected),
+      n_bins_avg = sum(!is.na(value)),
+      n_genes    = n(),
+      .groups    = "drop"
+    )
+
+  # "means": one log ratio per slot, taken AFTER averaging the raw signal, so
+  # empty bins pull the mean down the way they should and real depletion
+  # survives. "legacy": mean_value is already a mean of per-bin logs.
+  out$mean_log_ratio <- if (identical(ratio_mode, "legacy")) {
+    out$mean_value
+  } else {
+    log(out$mean_value / out$expected)
+  }
+
+  # Attach the genes behind every position: how many distinct genes contribute,
+  # and their names. The list is capped so one cell cannot blow past Excel's
+  # 32,767-character limit when the whole annotation is in scope.
+  if (length(gene_slots) > 0) {
+    g_all <- mcols(genes_gr)$gene_name
+    if (is.null(g_all)) g_all <- as.character(seq_along(genes_gr))
+
+    gmap <- bind_rows(gene_slots)
+    gmap$gene <- g_all[gmap$gene_idx]
+    gmap <- gmap[!is.na(gmap$gene), c("slot", "gene")]
+    gmap <- gmap[!duplicated(gmap), ]
+
+    # Total distinct genes contributing anywhere in the profile. Reported next
+    # to the per-position counts so a figure caption states a real sample size
+    # instead of just the single best-covered position.
+    n_genes_total <- dplyr::n_distinct(gmap$gene)
+
+    gmap <- gmap %>%
+      group_by(slot) %>%
+      summarise(
+        n_genes_distinct = dplyr::n(),
+        genes = {
+          g <- sort(gene)
+          if (length(g) > 100) {
+            paste0(paste(g[1:100], collapse = ";"), ";(+", length(g) - 100, " more)")
+          } else {
+            paste(g, collapse = ";")
+          }
+        },
+        .groups = "drop"
+      )
+
+    out <- dplyr::left_join(out, gmap, by = "slot")
+    out$n_genes_total <- n_genes_total
+  }
+
+  out %>% filter(is.finite(mean_log_ratio))
 }
 
 #' Compute metagene profile around TSS or gene body
@@ -354,7 +775,27 @@ compute_metagene <- function(hmm, genes_gr, marks, conditions,
   region_width <- width(ref_points)[gi]
   bin_mid      <- bin_mid_all[bi]
 
-  rel_pos  <- (bin_mid - region_start) / region_width
+  rel_pos <- (bin_mid - region_start) / region_width
+
+  # STRAND. The window itself is placed strand-aware above (promoters() for TSS,
+  # the mirrored construction for TES), but rel_pos is measured left-to-right in
+  # genomic coordinates. For a gene on the minus strand the 5' end is on the
+  # RIGHT, so the fraction has to be flipped — otherwise minus-strand genes are
+  # averaged in backwards and the profile comes out mirror-symmetric (a promoter
+  # mark then appears at BOTH ends of the gene body instead of only at the TSS).
+  # The Enrichment Profile tab already does this; the metagene did not.
+  is_minus <- as.character(strand(ref_points))[gi] == "-"
+  rel_pos  <- ifelse(is_minus, 1 - rel_pos, rel_pos)
+
+  # Bins are 200–250bp wide, so a bin can overlap the window while its midpoint
+  # falls outside it. Clamping those into the first/last slot piles flanking
+  # signal onto the two end points; drop them instead.
+  inside <- rel_pos >= 0 & rel_pos <= 1
+  bi     <- bi[inside]
+  gi     <- gi[inside]
+  rel_pos <- rel_pos[inside]
+  if (length(bi) == 0) return(NULL)
+
   slot_idx <- pmin(pmax(ceiling(rel_pos * n_bins), 1L), n_bins)
 
   all_profiles <- list()
@@ -386,6 +827,78 @@ compute_metagene <- function(hmm, genes_gr, marks, conditions,
       se_signal   = sd(signal,   na.rm = TRUE) / sqrt(n()),
       .groups     = "drop"
     )
+}
+
+
+#' Per-gene contributions to a metagene profile.
+#'
+#' Same windows and the same strand-aware positioning as compute_metagene(),
+#' but WITHOUT averaging across genes: returns one row per gene per position.
+#' This is what lets you ask whether an average profile reflects most genes or
+#' is carried by a handful of very strong ones.
+#'
+#' Returns a data.frame: gene, bin_idx, signal (mean RPKM over the bins of that
+#' gene falling in that position slot).
+compute_gene_contributions <- function(hmm, genes_gr, mark, condition,
+                                       mode       = "TSS",
+                                       upstream   = 2000,
+                                       downstream = 2000,
+                                       n_bins     = 100) {
+
+  bins        <- hmm$bins
+  bins_df     <- expand_bins_df(hmm)
+  bin_mid_all <- (bins_df$start + bins_df$end) / 2
+
+  rpkm_cols_all <- grep("counts.rpkm", colnames(bins_df), value = TRUE, fixed = TRUE)
+  pattern <- paste0("counts.rpkm.", mark, ".", condition)
+  cols    <- grep(pattern, rpkm_cols_all, value = TRUE, fixed = TRUE)
+  if (length(cols) == 0) return(NULL)
+  sig_vec <- rowMeans(bins_df[, cols, drop = FALSE], na.rm = TRUE)
+
+  if (mode == "TSS") {
+    ref_points <- promoters(genes_gr, upstream = upstream, downstream = downstream)
+  } else if (mode == "TES") {
+    str_g <- as.character(strand(genes_gr))
+    tes   <- ifelse(str_g == "-", start(genes_gr), end(genes_gr))
+    win_start <- ifelse(str_g == "-", tes - downstream, tes - upstream)
+    win_end   <- ifelse(str_g == "-", tes + upstream,   tes + downstream)
+    win_start <- pmax(1, win_start)
+    ref_points <- GRanges(seqnames = seqnames(genes_gr),
+                          ranges   = IRanges(win_start, win_end),
+                          strand   = strand(genes_gr))
+  } else {
+    ref_points <- genes_gr
+  }
+
+  g_names <- mcols(genes_gr)$gene_name
+  if (is.null(g_names)) g_names <- as.character(seq_along(genes_gr))
+  mcols(ref_points) <- NULL
+  mcols(ref_points)$gene_name <- g_names
+
+  ov <- findOverlaps(bins, ref_points)
+  if (length(ov) == 0) return(NULL)
+
+  bi <- queryHits(ov)
+  gi <- subjectHits(ov)
+
+  rel_pos  <- (bin_mid_all[bi] - start(ref_points)[gi]) / width(ref_points)[gi]
+  is_minus <- as.character(strand(ref_points))[gi] == "-"
+  rel_pos  <- ifelse(is_minus, 1 - rel_pos, rel_pos)
+
+  inside  <- rel_pos >= 0 & rel_pos <= 1
+  bi      <- bi[inside]; gi <- gi[inside]; rel_pos <- rel_pos[inside]
+  if (length(bi) == 0) return(NULL)
+
+  slot_idx <- pmin(pmax(ceiling(rel_pos * n_bins), 1L), n_bins)
+
+  data.frame(
+    gene    = mcols(ref_points)$gene_name[gi],
+    bin_idx = slot_idx,
+    signal  = sig_vec[bi],
+    stringsAsFactors = FALSE
+  ) %>%
+    group_by(gene, bin_idx) %>%
+    summarise(signal = mean(signal, na.rm = TRUE), .groups = "drop")
 }
 
 #' Compare two gene sets by their per-gene promoter-averaged posterior
@@ -815,6 +1328,7 @@ ui <- dashboardPage(
       id = "sidebar_tabs",
       menuItem("Load Data",       tabName = "load",       icon = icon("folder-open")),
       menuItem("Metagene Profile",tabName = "metagene",   icon = icon("chart-area")),
+      menuItem("Gene Contributions", tabName = "genecontrib", icon = icon("layer-group")),
       menuItem("Enrichment Profile", tabName = "enrichment", icon = icon("chart-line")),
       menuItem("Region Browser",  tabName = "browser",    icon = icon("dna")),
       menuItem("Differential Peaks", tabName = "diffpeaks", icon = icon("chart-simple")),
@@ -943,6 +1457,14 @@ ui <- dashboardPage(
             uiOutput("condition_order_ui"),
             actionButton("reset_condition_order", "Reset to detected order",
                         class = "btn-sm btn-default"),
+            hr(),
+            h5("Condition colours"),
+            tags$small(style = "color:#888",
+              "Pick a colour for each condition. That colour is then used for the condition everywhere in the app — metagene, region browser, differential peaks, gene set comparison and the ranked figures — so one condition looks the same in every figure you export."),
+            br(), br(),
+            uiOutput("condition_colour_ui"),
+            actionButton("reset_condition_colours", "Reset colours",
+                        class = "btn-sm btn-default"),
             br(), br(),
             uiOutput("condition_order_preview")
           )
@@ -968,9 +1490,9 @@ ui <- dashboardPage(
             hr(),
             h5("Gene scope"),
             radioButtons("gene_scope_meta", NULL,
-                         choices = c("Only selected genes" = "selected",
-                                     "All genes in GTF"     = "all"),
-                         selected = "selected"),
+                         choices = c("All genes in GTF"    = "all",
+                                     "Only selected genes" = "selected"),
+                         selected = "all"),
             tags$small(style = "color:#888",
               "This plot is anchored to TSS/gene-body position, so it can only ever include bins that overlap a gene — there's no \"intergenic\" position to plot relative to. To see truly intergenic bins (not part of any gene), use the Region Browser tab with bin scope set to \"All bins, including intergenic.\""),
             hr(),
@@ -998,10 +1520,32 @@ ui <- dashboardPage(
             checkboxInput("smooth_metagene",
                          "Smooth curve (LOESS) — recommended for many genes",
                          value = TRUE),
+            hr(),
+            # ========== NEW: PLOT CUSTOMIZATION PANEL (METAGENE) ==========
+            box(
+              title = HTML("<i class='fa fa-sliders-h'></i> Plot Appearance"),
+              width = 12, status = "info", collapsible = TRUE, collapsed = TRUE,
+              h5("Text Sizes"),
+              sliderInput("mg_plot_title_size", "Title size", min = 10, max = 20, value = 14, step = 1),
+              sliderInput("mg_plot_axis_title_size", "Axis title size", min = 8, max = 18, value = 12, step = 1),
+              sliderInput("mg_plot_axis_text_size", "Axis labels size", min = 6, max = 16, value = 10, step = 1),
+              sliderInput("mg_plot_legend_size", "Legend text size", min = 8, max = 14, value = 10, step = 1),
+              hr(),
+              h5("Lines & Visual Elements"),
+              sliderInput("mg_plot_line_width", "Line width", min = 0.3, max = 2.5, value = 0.8, step = 0.1),
+              sliderInput("mg_plot_point_size", "Point/marker size", min = 1, max = 5, value = 2, step = 0.5),
+              sliderInput("mg_plot_alpha", "Transparency of fills", min = 0.1, max = 1, value = 0.2, step = 0.1),
+              hr(),
+              h5("Other Elements"),
+              checkboxInput("mg_plot_show_grid", "Show gridlines", value = TRUE),
+              tags$small(style = "color:#888; display:block; margin-top:10px;",
+                "Adjust and click 'Compute Profile' to apply."
+              )
+            ),
             actionButton("run_metagene", "Compute Profile",
                          class = "btn-primary btn-block")
-          ),
-          box(title = "Metagene Profile", width = 9, status = "primary",
+        ),
+        box(title = "Metagene Profile", width = 9, status = "primary",
             plotOutput("metagene_plot", height = "550px"),
             downloadButton("dl_metagene", "Download Plot"),
             downloadButton("dl_metagene_xlsx", "Download Data (Excel)")
@@ -1009,6 +1553,93 @@ ui <- dashboardPage(
         )
       ),
 
+
+      # -----------------------------------------------------------------------
+      # TAB 2.5 — GENE CONTRIBUTIONS
+      # -----------------------------------------------------------------------
+      tabItem(tabName = "genecontrib",
+        fluidRow(
+          box(title = "Gene Contribution Settings", width = 3, status = "warning",
+            tags$small(style = "color:#888",
+              "Breaks a metagene profile back down into the individual genes behind it: which genes carry the signal, how concentrated it is, and what the average line hides."),
+            hr(),
+            uiOutput("gc_stage_ui"),
+            uiOutput("gc_mark_ui"),
+            uiOutput("gc_condition_ui"),
+            radioButtons("gc_mode", "Reference",
+                         choices = c("TSS" = "TSS", "TES" = "TES",
+                                     "Gene body" = "gene_body"),
+                         selected = "TSS"),
+            conditionalPanel(
+              condition = "input.gc_mode != 'gene_body'",
+              numericInput("gc_upstream",   "Upstream (bp)",   value = 2000, min = 0, step = 100),
+              numericInput("gc_downstream", "Downstream (bp)", value = 2000, min = 0, step = 100)
+            ),
+            numericInput("gc_n_bins", "Number of bins", value = 40, min = 10, max = 200, step = 5),
+            hr(),
+            h5("Gene scope"),
+            radioButtons("gc_gene_scope", NULL,
+                         choices = c("All genes in annotation" = "all",
+                                     "Only selected genes"     = "selected"),
+                         selected = "all"),
+            conditionalPanel(
+              condition = "input.gc_gene_scope == 'selected'",
+              uiOutput("gene_selector_gc")
+            ),
+            hr(),
+            numericInput("gc_top_n", "Genes to show in heatmap (top N by signal)",
+                         value = 200, min = 10, max = 5000, step = 50),
+            checkboxInput("gc_log_scale", "Log-scale the heatmap colours", value = TRUE),
+        
+        # ========== NEW: PLOT CUSTOMIZATION PANEL ==========
+        box(
+          title = HTML("<i class='fa fa-sliders-h'></i> Plot Appearance"),
+          width = 12, status = "info", collapsible = TRUE, collapsed = TRUE,
+          h5("Text Sizes"),
+          sliderInput("gc_plot_title_size", "Title size", min = 10, max = 20, value = 14, step = 1),
+          sliderInput("gc_plot_axis_title_size", "Axis title size", min = 8, max = 18, value = 12, step = 1),
+          sliderInput("gc_plot_axis_text_size", "Axis labels size", min = 6, max = 16, value = 10, step = 1),
+          sliderInput("gc_plot_legend_size", "Legend text size", min = 8, max = 14, value = 10, step = 1),
+          hr(),
+          h5("Lines & Visual Elements"),
+          sliderInput("gc_plot_line_width", "Line width", min = 0.3, max = 2.5, value = 0.8, step = 0.1),
+          sliderInput("gc_plot_point_size", "Point/marker size", min = 1, max = 5, value = 2, step = 0.5),
+          sliderInput("gc_plot_alpha", "Transparency", min = 0.1, max = 1, value = 0.2, step = 0.1),
+          hr(),
+          h5("Other Elements"),
+          checkboxInput("gc_plot_show_grid", "Show gridlines", value = TRUE),
+          tags$small(style = "color:#888; display:block; margin-top:10px;",
+            "Adjust and click 'Compute' to apply."
+          )
+          ),
+            hr(),
+            actionButton("run_genecontrib", "Compute Contributions",
+                         class = "btn-primary btn-block")
+          ),
+          column(9,
+            box(title = "Per-gene signal heatmap", width = 12, status = "primary",
+              tags$small(style = "color:#888",
+                "One row per gene, sorted by total signal in the window. The metagene line on the previous tab is essentially the column-wise average of this matrix — this is what that average is hiding."),
+              plotOutput("gc_heatmap", height = "600px"),
+              downloadButton("dl_gc_heatmap", "Download Heatmap (PDF)")
+            ),
+            box(title = "How concentrated is the signal?", width = 12, status = "primary",
+              tags$small(style = "color:#888",
+                "Genes ranked from strongest to weakest. A curve that shoots up immediately means a few genes carry the profile; a diagonal means every gene contributes equally."),
+              plotOutput("gc_cumulative", height = "380px"),
+              uiOutput("gc_concentration_text"),
+              downloadButton("dl_gc_cumulative", "Download Curve (PDF)")
+            ),
+            box(title = "Gene ranking", width = 12, status = "primary",
+              tags$small(style = "color:#888",
+                "Every gene with its mean and peak signal in the window, its share of the total, and its running cumulative share."),
+              DTOutput("gc_table"),
+              br(),
+              downloadButton("dl_gc_xlsx", "Download Gene Table (Excel)")
+            )
+          )
+        )
+      ),
       # -----------------------------------------------------------------------
       # TAB 2.5 — ENRICHMENT PROFILE (log observed/expected, like reference fig)
       # -----------------------------------------------------------------------
@@ -1016,7 +1647,7 @@ ui <- dashboardPage(
         fluidRow(
           box(title = "Enrichment Settings", width = 3, status = "warning",
             tags$small(style = "color:#888",
-              "Shows log(observed/expected) enrichment of each mark around gene boundaries (TSS and TES), one panel per mark."),
+              "Shows log(observed/expected) enrichment around gene boundaries (TSS and TES). Panels can be one per mark (conditions overlaid) or one per condition with all marks overlaid, as in the Galaxy chromstaR output."),
             hr(),
             numericInput("enr_upstream",   "Upstream of TSS (bp)",   value = 2000, min = 100, max = 10000, step = 100),
             numericInput("enr_downstream", "Downstream of TES (bp)", value = 2000, min = 100, max = 10000, step = 100),
@@ -1024,9 +1655,9 @@ ui <- dashboardPage(
             hr(),
             h5("Gene scope"),
             radioButtons("gene_scope_enr", NULL,
-                         choices = c("Only selected genes" = "selected",
-                                     "All genes in GTF"     = "all"),
-                         selected = "selected"),
+                         choices = c("All genes in GTF"    = "all",
+                                     "Only selected genes" = "selected"),
+                         selected = "all"),
             tags$small(style = "color:#888",
               "This plot is anchored to gene boundaries (TSS/TES), so it can only ever include bins that overlap a gene's window — there's no \"intergenic\" position to plot relative to. To see truly intergenic bins, use the Region Browser tab with bin scope set to \"All bins, including intergenic.\""),
             hr(),
@@ -1046,7 +1677,43 @@ ui <- dashboardPage(
             h5("Stages to compare"),
             uiOutput("stage_selector_enr"),
             hr(),
+            h5("Panel layout"),
+            radioButtons("enr_layout", NULL,
+                         choices = c("One panel per mark (colour = condition)"    = "by_mark",
+                                     "One panel per condition (colour = mark)"    = "by_condition"),
+                         selected = "by_mark"),
+            hr(),
+            h5("Ratio calculation"),
+            radioButtons("enr_expected", NULL,
+                         choices = c("Ratio of means (recommended)"        = "means",
+                                     "Mean of per-bin log ratios (legacy)" = "legacy"),
+                         selected = "means"),
+            tags$small(style = "color:#888",
+              "\"Ratio of means\" averages the raw signal at each position — zero bins included — then takes one log ratio against the genome-wide mean, as the Galaxy chromstaR profile does. \"Legacy\" logs each bin first and averages the logs, which forces zero bins to be discarded; that inflates exactly the positions where a mark is absent, so genuine depletion is flattened out."),
+            hr(),
             checkboxInput("smooth_enrichment", "Smooth curve (LOESS)", value = FALSE),
+        
+        # ========== NEW: PLOT CUSTOMIZATION PANEL (ENRICHMENT) ==========
+        box(
+          title = HTML("<i class='fa fa-sliders-h'></i> Plot Appearance"),
+          width = 12, status = "info", collapsible = TRUE, collapsed = TRUE,
+          h5("Text Sizes"),
+          sliderInput("enr_plot_title_size", "Title size", min = 10, max = 20, value = 14, step = 1),
+          sliderInput("enr_plot_axis_title_size", "Axis title size", min = 8, max = 18, value = 12, step = 1),
+          sliderInput("enr_plot_axis_text_size", "Axis labels size", min = 6, max = 16, value = 10, step = 1),
+          sliderInput("enr_plot_legend_size", "Legend text size", min = 8, max = 14, value = 10, step = 1),
+          hr(),
+          h5("Lines & Visual Elements"),
+          sliderInput("enr_plot_line_width", "Line width", min = 0.3, max = 2.5, value = 0.8, step = 0.1),
+          sliderInput("enr_plot_point_size", "Point size", min = 1, max = 5, value = 2, step = 0.5),
+          sliderInput("enr_plot_alpha", "Transparency", min = 0.1, max = 1, value = 0.2, step = 0.1),
+          hr(),
+          h5("Other Elements"),
+          checkboxInput("enr_plot_show_grid", "Show gridlines", value = TRUE),
+          tags$small(style = "color:#888; display:block; margin-top:10px;",
+            "Adjust and click 'Compute Enrichment' to apply."
+          )
+          ),
             actionButton("run_enrichment", "Compute Enrichment",
                          class = "btn-primary btn-block")
           ),
@@ -1104,6 +1771,28 @@ ui <- dashboardPage(
                          choices = c("Side-by-side" = "facet",
                                      "Overlay"       = "overlay"),
                          selected = "facet"),
+        
+        # ========== NEW: PLOT CUSTOMIZATION PANEL ==========
+        box(
+          title = HTML("<i class='fa fa-sliders-h'></i> Plot Appearance"),
+          width = 12, status = "info", collapsible = TRUE, collapsed = TRUE,
+          h5("Text Sizes"),
+          sliderInput("br_plot_title_size", "Title size", min = 10, max = 20, value = 14, step = 1),
+          sliderInput("br_plot_axis_title_size", "Axis title size", min = 8, max = 18, value = 12, step = 1),
+          sliderInput("br_plot_axis_text_size", "Axis labels size", min = 6, max = 16, value = 10, step = 1),
+          sliderInput("br_plot_legend_size", "Legend text size", min = 8, max = 14, value = 10, step = 1),
+          hr(),
+          h5("Lines & Visual Elements"),
+          sliderInput("br_plot_line_width", "Line width", min = 0.3, max = 2.5, value = 0.8, step = 0.1),
+          sliderInput("br_plot_point_size", "Point/marker size", min = 1, max = 5, value = 2, step = 0.5),
+          sliderInput("br_plot_alpha", "Transparency", min = 0.1, max = 1, value = 0.2, step = 0.1),
+          hr(),
+          h5("Other Elements"),
+          checkboxInput("br_plot_show_grid", "Show gridlines", value = TRUE),
+          tags$small(style = "color:#888; display:block; margin-top:10px;",
+            "Adjust and click 'Compute' to apply."
+          )
+          ),
             actionButton("run_browser", "Load Region",
                          class = "btn-primary btn-block")
           ),
@@ -1148,6 +1837,23 @@ ui <- dashboardPage(
             numericInput("diff_width_thresh", "Min merged region width (bp)",
                         value = 300, min = 0, step = 100),
             hr(),
+            h5("Gene scope"),
+            radioButtons("diff_gene_scope", NULL,
+                         choices = c("Whole genome (all segments)" = "all",
+                                     "Only selected genes"         = "selected"),
+                         selected = "all"),
+            conditionalPanel(
+              condition = "input.diff_gene_scope == 'selected'",
+              fluidRow(
+                column(6, actionButton("select_all_genes_diff", "Select all",
+                                       class = "btn-sm btn-block")),
+                column(6, actionButton("clear_all_genes_diff", "Clear all",
+                                       class = "btn-sm btn-block"))
+              ),
+              br(),
+              uiOutput("gene_selector_diff")
+            ),
+            hr(),
             h5("Conditions to compare"),
             uiOutput("diff_condition_ui"),
             tags$small(style = "color:#888",
@@ -1167,6 +1873,35 @@ ui <- dashboardPage(
             tags$small(style = "color:#888",
               "Each stage is filtered and counted independently and shown in its own row of panels."),
             hr(),
+            h5("Ranked figure style"),
+            radioButtons("dp_rank_style", NULL,
+                         choices = c("Stacked (gained + lost)"        = "stacked",
+                                     "Diverging (lost | gained)"      = "diverging"),
+                         selected = "stacked"),
+            tags$small(style = "color:#888",
+              "Both styles draw gains and losses separately, so no single bar stands for a mixture of the two. Stacked keeps the ranking by total change; diverging puts losses left of zero and gains right."),
+            hr(),
+            # ========== NEW: PLOT CUSTOMIZATION PANEL (DIFFERENTIAL PEAKS) ==========
+            box(
+              title = HTML("<i class='fa fa-sliders-h'></i> Plot Appearance"),
+              width = 12, status = "info", collapsible = TRUE, collapsed = TRUE,
+              h5("Text Sizes"),
+              sliderInput("dp_plot_title_size", "Title size", min = 10, max = 20, value = 14, step = 1),
+              sliderInput("dp_plot_axis_title_size", "Axis title size", min = 8, max = 18, value = 12, step = 1),
+              sliderInput("dp_plot_axis_text_size", "Axis labels size", min = 6, max = 16, value = 10, step = 1),
+              sliderInput("dp_plot_legend_size", "Legend text size", min = 8, max = 14, value = 10, step = 1),
+              hr(),
+              h5("Lines & Visual Elements"),
+              sliderInput("dp_plot_line_width", "Line width", min = 0.3, max = 2.5, value = 0.8, step = 0.1),
+              sliderInput("dp_plot_point_size", "Point/marker size", min = 1, max = 5, value = 2, step = 0.5),
+              sliderInput("dp_plot_alpha", "Transparency", min = 0.1, max = 1, value = 0.2, step = 0.1),
+              hr(),
+              h5("Other Elements"),
+              checkboxInput("dp_plot_show_grid", "Show gridlines", value = TRUE),
+              tags$small(style = "color:#888; display:block; margin-top:10px;",
+                "Adjust and click 'Compute Differential Peaks' to apply."
+              )
+            ),
             actionButton("run_diffpeaks", "Compute Differential Peaks",
                         class = "btn-primary btn-block")
           ),
@@ -1174,6 +1909,38 @@ ui <- dashboardPage(
             uiOutput("diffpeaks_plot_container"),
             downloadButton("dl_diffpeaks_plot", "Download Plot"),
             downloadButton("dl_diffpeaks_xlsx", "Download Data (Excel)")
+          )
+        ),
+        fluidRow(
+          box(title = "Per-mark summary — differential regions", width = 12,
+              status = "primary", collapsible = TRUE,
+            tags$small(style = "color:#888",
+              "Gained / lost counts per mark across the differential regions, with each direction as its own percentage. The \"Direction\" label only says which side is larger — read the Gained and Lost columns for the actual numbers."),
+            br(), br(),
+            uiOutput("diffpeaks_overlap_note"),
+            br(),
+            DTOutput("diffpeaks_mark_table"),
+            br(),
+            downloadButton("dl_diffpeaks_mark_table", "Download Table (Excel)")
+          )
+        ),
+        fluidRow(
+          box(title = "Marks ranked by change — differential regions", width = 12,
+              status = "primary", collapsible = TRUE,
+            tags$small(style = "color:#888",
+              "The same differential regions as the chart above, ranked by how many regions each mark changes in. Each bar is split into gained and lost, so the colour never stands for a total that mixes the two. The label is the combined percentage of differential regions — read the table above for the split."),
+            plotOutput("diffpeaks_rank_filtered", height = "430px"),
+            downloadButton("dl_diffpeaks_rank_filtered", "Download Plot (PDF)")
+          )
+        ),
+        fluidRow(
+          box(title = "Marks ranked by change — genome-wide (all domains)", width = 12,
+              status = "primary", collapsible = TRUE,
+            tags$small(style = "color:#888",
+              "Unfiltered, domain-level view built from the object's combination-frequency table: every domain in the genome, with no score or width filter. Bars are split into gained and lost as above. Percentages are of all domains, so they are not comparable with the filtered figure."),
+            uiOutput("diffpeaks_rank_genome_note"),
+            plotOutput("diffpeaks_rank_genome", height = "430px"),
+            downloadButton("dl_diffpeaks_rank_genome", "Download Plot (PDF)")
           )
         )
       ),
@@ -1205,6 +1972,28 @@ ui <- dashboardPage(
             radioButtons("gsc_summary_stat", "Summary statistic",
                         choices = c("Mean" = "mean", "Median" = "median"),
                         selected = "mean"),
+        
+        # ========== NEW: PLOT CUSTOMIZATION PANEL ==========
+        box(
+          title = HTML("<i class='fa fa-sliders-h'></i> Plot Appearance"),
+          width = 12, status = "info", collapsible = TRUE, collapsed = TRUE,
+          h5("Text Sizes"),
+          sliderInput("gsc_plot_title_size", "Title size", min = 10, max = 20, value = 14, step = 1),
+          sliderInput("gsc_plot_axis_title_size", "Axis title size", min = 8, max = 18, value = 12, step = 1),
+          sliderInput("gsc_plot_axis_text_size", "Axis labels size", min = 6, max = 16, value = 10, step = 1),
+          sliderInput("gsc_plot_legend_size", "Legend text size", min = 8, max = 14, value = 10, step = 1),
+          hr(),
+          h5("Lines & Visual Elements"),
+          sliderInput("gsc_plot_line_width", "Line width", min = 0.3, max = 2.5, value = 0.8, step = 0.1),
+          sliderInput("gsc_plot_point_size", "Point/marker size", min = 1, max = 5, value = 2, step = 0.5),
+          sliderInput("gsc_plot_alpha", "Transparency", min = 0.1, max = 1, value = 0.2, step = 0.1),
+          hr(),
+          h5("Other Elements"),
+          checkboxInput("gsc_plot_show_grid", "Show gridlines", value = TRUE),
+          tags$small(style = "color:#888; display:block; margin-top:10px;",
+            "Adjust and click 'Compute' to apply."
+          )
+          ),
             tags$small(style = "color:#888",
               "Used for the group comparison (delta and the displayed stat_A/stat_B columns). Both mean and median are always shown for reference; this controls which one drives delta and the permutation test's central value."),
             hr(),
@@ -1304,8 +2093,24 @@ ui <- dashboardPage(
               ),
 
               hr(),
+              tags$h3("2.5 Gene Contributions tab"),
+              tags$p(tags$b("Purpose:"), " breaks a metagene profile back down into the individual genes behind it. An average curve cannot tell you whether every gene looks like that or whether ten genes carry the whole signal — this tab answers that."),
+              tags$ul(
+                tags$li(tags$b("\"Histone mark\" / \"Condition\" / \"Reference\""), " — one mark and one condition at a time, anchored at the TSS, TES or across the gene body, with the same windows and the same strand handling as the Metagene tab."),
+                tags$li(tags$b("Per-gene signal heatmap"), " — one row per gene, columns are positions, sorted with the strongest gene at the top. Colours can be log-scaled and are capped at the 99th percentile so a single extreme gene does not wash out the rest."),
+                tags$li(tags$b("Concentration curve"), " — genes ranked strongest first against their cumulative share of the total signal. A curve hugging the top-left means a few genes carry the profile; the dashed diagonal is what perfectly even contribution would look like."),
+                tags$li(tags$b("Gini coefficient"), " — 0 means every gene contributes equally, 1 means a single gene carries everything. Above roughly 0.6, the mean profile describes a minority of genes and should be reported alongside a heatmap or a median line."),
+                tags$li(tags$b("Gene ranking table"), " — every gene with its mean and peak signal, the position of its peak, its share of the total and the running cumulative share. Sortable, filterable and exportable."),
+                tags$li(tags$b("\"Download Gene Table (Excel)\""), " — two sheets: the ranking, and the full gene-by-position matrix behind the heatmap.")
+              ),
+
+              hr(),
               tags$h3("3. Enrichment Profile tab"),
-              tags$p(tags$b("Purpose:"), " plot log(observed/expected) enrichment of each mark around gene boundaries (TSS and TES together), one panel per mark — useful for seeing which marks are relatively enriched or depleted across a gene versus the genome-wide average."),
+              tags$p(tags$b("Purpose:"), " plot log(observed/expected) enrichment of each mark around gene boundaries (TSS and TES together) — useful for seeing which marks are relatively enriched or depleted across a gene versus the genome-wide average."),
+              tags$ul(
+                tags$li(tags$b("\"Panel layout\""), " — \"One panel per mark\" overlays the conditions inside each mark's panel (best for asking how one mark changes across the life cycle); \"One panel per condition\" overlays all marks inside each condition's panel, the layout used by the Galaxy chromstaR output (best for asking which marks dominate at a given stage)."),
+                tags$li(tags$b("\"Expected (baseline)\""), " — the denominator of log(observed/expected). The observed side has to drop bins with zero signal, because log(0) is undefined, so \"Mean over covered bins\" uses the same set of bins on both sides. \"Mean over all genomic bins\" divides by a mean that includes every empty bin, which shifts each curve upward by log(mean covered / mean all); because coverage sparsity differs per mark and per condition, that shift differs per curve and conditions can no longer be compared by their vertical position.")
+              ),
               tags$ul(
                 tags$li(tags$b("\"Upstream of TSS (bp)\" / \"Downstream of TES (bp)\""), " — how far before the start and after the end of each gene to include."),
                 tags$li(tags$b("\"Bins per region\""), " — resolution of the plot; more bins = finer detail."),
@@ -1336,6 +2141,7 @@ ui <- dashboardPage(
               tags$ul(
                 tags$li(tags$b("\"Min differential score\""), " — only keep chromatin segments with a confidence score at or above this threshold (closer to 1 = stricter, fewer but more confident segments)."),
                 tags$li(tags$b("\"Min merged region width (bp)\""), " — discard segments shorter than this, to avoid counting tiny noisy regions."),
+                tags$li(tags$b("\"Gene scope\""), " — \"Whole genome\" counts every chromatin segment (the default, and what the Galaxy differential tool does); \"Only selected genes\" keeps only segments overlapping the genes you paste in, so you can ask whether a specific gene set is remodelled between stages."),
                 tags$li(tags$b("\"Conditions to compare\""), " — pick between 2 and 5 conditions from the loaded object. Only these are used on this tab."),
                 tags$li(tags$b("\"Comparison mode\""), " — \"All pairwise combinations\" makes one panel for every possible pair of the chosen conditions (5 conditions = 10 panels); \"One reference vs the others\" compares every chosen condition against a single reference you pick (5 conditions = 4 panels), which is usually what you want for a life-cycle baseline."),
                 tags$li("Within each panel, the two bars per mark are coloured by the condition the mark is present in — same colours as everywhere else in the app."),
@@ -1682,10 +2488,58 @@ server <- function(input, output, session) {
   # colour whether it's plotted from Stage A alone or alongside Stage B.
   base_palette <- c("#E63946", "#2196F3", "#FF9800", "#4CAF50",
                     "#9C27B0", "#00BCD4", "#795548", "#607D8B")
+  # Default colour for a condition, purely from its position in the order.
+  default_condition_palette <- function(conds) {
+    stats::setNames(base_palette[((seq_along(conds) - 1) %% length(base_palette)) + 1], conds)
+  }
+
+  # The palette every figure in the app uses. Starts from the position-based
+  # default and lets the per-condition colour pickers override it, so one
+  # condition keeps the same colour across every tab.
   condition_palette <- function() {
     conds <- ordered_conditions()
-    setNames(base_palette[((seq_along(conds) - 1) %% length(base_palette)) + 1], conds)
+    pal   <- default_condition_palette(conds)
+    for (cnd in conds) {
+      v <- input[[cond_colour_id(cnd)]]
+      if (!is.null(v) && length(v) == 1 && grepl("^#[0-9A-Fa-f]{6}$", v)) pal[[cnd]] <- v
+    }
+    pal
   }
+
+  # One picker per condition. isolate() on the current value means re-rendering
+  # (e.g. after reordering conditions) keeps whatever the user already chose.
+  output$condition_colour_ui <- renderUI({
+    conds <- ordered_conditions()
+    req(length(conds) > 0)
+    defaults <- default_condition_palette(conds)
+    tagList(lapply(conds, function(cnd) {
+      id  <- cond_colour_id(cnd)
+      cur <- isolate(input[[id]])
+      val <- if (!is.null(cur) && grepl("^#[0-9A-Fa-f]{6}$", cur)) cur else unname(defaults[[cnd]])
+      div(style = "display:inline-block; margin-right:18px; vertical-align:top;",
+          condition_colour_input(id, cnd, val))
+    }))
+  })
+
+  observeEvent(input$reset_condition_colours, {
+    conds    <- ordered_conditions()
+    defaults <- default_condition_palette(conds)
+    for (cnd in conds) {
+      updateTextInput(session, cond_colour_id(cnd), value = unname(defaults[[cnd]]))
+    }
+  })
+  # A colour palette keyed by *mark name*, used when marks are the thing being
+  # compared inside a panel (Galaxy-style "one panel per condition" layout).
+  # Okabe-Ito qualitative palette — distinguishable in colour-blind vision and
+  # in greyscale print.
+  mark_base_palette <- c("#0072B2", "#E69F00", "#009E73", "#CC79A7",
+                         "#D55E00", "#56B4E9", "#F0E442", "#000000")
+  mark_palette <- function(marks) {
+    marks <- unique(marks)
+    setNames(mark_base_palette[((seq_along(marks) - 1) %% length(mark_base_palette)) + 1],
+             marks)
+  }
+
   # Union of marks across every loaded stage — used to build "Marks to
   # display" checkboxes so a mark present in only one stage still shows up.
   all_marks_reactive <- reactive({
@@ -1742,6 +2596,11 @@ server <- function(input, output, session) {
           gene_name = df$gene_name
         )
         rv$genes <- genes
+        # Drop the cached bin annotation so it is recomputed against THIS gene
+        # file — otherwise a stale annotation from a previously loaded (or
+        # mismatched) annotation stays in the Data Table for the whole session.
+        rv$bin_annotation   <- NULL
+        rv$bin_annotation_b <- NULL
 
       }, error = function(e) {
         showNotification(paste("Error loading gene file:", e$message), type = "error")
@@ -1859,7 +2718,9 @@ server <- function(input, output, session) {
     req(rv$genes)
     nms      <- gene_names_reactive()
     # Default: first 20 genes selected — fast to compute, user can change
-    defaults <- paste(head(nms, 20), collapse = "\n")
+    defaults <- ""   # deliberately empty — a pre-filled list looks like a
+                     # placeholder but is real input, and silently reduced
+                     # every profile to those few genes
     tagList(
       tags$small(style = "color:#888",
         paste0(length(nms), " genes in GTF — paste a list from Excel (one gene per row) or use the buttons above. Only bins overlapping the selected genes' TSS/body window are used; intergenic bins are excluded automatically.")),
@@ -1931,7 +2792,9 @@ server <- function(input, output, session) {
   output$gene_selector_enr <- renderUI({
     req(rv$genes)
     nms      <- gene_names_reactive()
-    defaults <- paste(head(nms, 20), collapse = "\n")
+    defaults <- ""   # deliberately empty — a pre-filled list looks like a
+                     # placeholder but is real input, and silently reduced
+                     # every profile to those few genes
     tagList(
       tags$small(style = "color:#888",
         paste0(length(nms), " genes in GTF — paste a list from Excel (one gene per row) or use the buttons above. Only bins overlapping the selected genes (plus flanks) are used; intergenic bins are excluded automatically.")),
@@ -2027,9 +2890,10 @@ server <- function(input, output, session) {
           genes_gr   = genes_sel,
           marks      = input$marks_enr,
           conditions = stage_conditions_kept(st),
-          upstream   = input$enr_upstream,
-          downstream = input$enr_downstream,
-          n_bins     = input$enr_n_bins
+          upstream      = input$enr_upstream,
+          downstream    = input$enr_downstream,
+          n_bins        = input$enr_n_bins,
+          ratio_mode    = input$enr_expected %||% "means"
         )
       })
     })
@@ -2056,24 +2920,38 @@ server <- function(input, output, session) {
     # Keep the user's life-cycle order for the legend and line styles
     conds       <- levels(droplevels(as.factor(df$condition)))
     multi_stage <- length(unique(df$stage)) > 1
-    line_types  <- setNames(rep(c("solid", "dotted", "dashed", "dotdash"),
-                               length.out = length(conds)), conds)
-    line_cols   <- condition_palette()
+    by_cond     <- identical(input$enr_layout, "by_condition")
+
+    # Whichever variable is compared *inside* a panel gets the colour and the
+    # line type; the other one becomes the facet.
+    if (by_cond) {
+      grp_levels <- unique(as.character(df$mark))
+      df$grp     <- factor(as.character(df$mark), levels = grp_levels)
+      line_cols  <- mark_palette(grp_levels)
+      legend_lab <- "Mark"
+    } else {
+      grp_levels <- conds
+      df$grp     <- factor(as.character(df$condition), levels = grp_levels)
+      line_cols  <- condition_palette()
+      legend_lab <- "Condition"
+    }
+    line_types <- setNames(rep(c("solid", "dotted", "dashed", "dotdash"),
+                              length.out = length(grp_levels)), grp_levels)
 
     # Shade the gene-body zone (x in [0,1]) so it's visually distinct from
     # the upstream/downstream flanks even before looking at axis labels
     body_shade <- data.frame(xmin = 0, xmax = 1, ymin = -Inf, ymax = Inf)
 
     p <- ggplot(df, aes(x = x, y = mean_log_ratio,
-                        colour = condition, linetype = condition)) +
+                        colour = grp, linetype = grp)) +
       geom_rect(data = body_shade,
                aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax),
                inherit.aes = FALSE, fill = "grey85", alpha = 0.35)
 
     if (isTRUE(input$smooth_enrichment)) {
-      p <- p + geom_smooth(method = "loess", span = 0.2, se = FALSE, linewidth = 0.9)
+      p <- p + geom_smooth(method = "loess", span = 0.2, se = FALSE, linewidth = input$enr_plot_line_width %||% 0.9)
     } else {
-      p <- p + geom_line(linewidth = 0.8)
+      p <- p + geom_line(linewidth = input$enr_plot_line_width %||% 0.8)
     }
 
     p <- p +
@@ -2085,43 +2963,69 @@ server <- function(input, output, session) {
       scale_colour_manual(values = line_cols) +
       scale_linetype_manual(values = line_types)
 
-    if (multi_stage) {
-      p <- p + facet_grid(stage ~ mark, scales = "free_y")
+    if (by_cond) {
+      # Galaxy-style: one panel per condition, every mark overlaid. A shared
+      # y scale here, so panels can be compared to each other directly.
+      if (multi_stage) {
+        p <- p + facet_grid(stage ~ condition)
+      } else {
+        p <- p + facet_wrap(~ condition, ncol = 2)
+      }
     } else {
-      p <- p + facet_wrap(~ mark, scales = "free_y", ncol = 4)
+      if (multi_stage) {
+        p <- p + facet_grid(stage ~ mark, scales = "free_y")
+      } else {
+        p <- p + facet_wrap(~ mark, scales = "free_y", ncol = 4)
+      }
     }
 
     p <- p +
       labs(
         x = NULL,
         y = "log(observed/expected)",
-        colour = "Condition", linetype = "Condition",
-        title    = "Histone Mark Enrichment — Per Mark",
-        subtitle = if (multi_stage) {
-          paste0(paste(unique(df$stage), collapse = " vs "),
-                "  |  grey band = gene body, vertical lines = TSS and TES")
-        } else {
-          paste0(paste(conds, collapse = " vs "),
-                "  |  grey band = gene body, vertical lines = TSS and TES")
-        }
+        colour = legend_lab, linetype = legend_lab,
+        title    = if (by_cond) "Histone Mark Enrichment — Per Condition"
+                   else         "Histone Mark Enrichment — Per Mark",
+        subtitle = paste0(
+          if (multi_stage) paste(unique(df$stage), collapse = " vs ")
+          else             paste(conds, collapse = " vs "),
+          if ("n_genes_distinct" %in% colnames(df)) {
+            v   <- df$n_genes_distinct[is.finite(df$n_genes_distinct)]
+            tot <- if ("n_genes_total" %in% colnames(df))
+                     suppressWarnings(max(df$n_genes_total, na.rm = TRUE)) else NA_real_
+            paste0(
+              if (is.finite(tot))
+                paste0("  |  ", format(tot, big.mark = ","), " genes total") else "",
+              if (length(v))
+                paste0("  |  ", format(min(v), big.mark = ","), "\u2013",
+                       format(max(v), big.mark = ","), " genes per position") else "")
+          } else "",
+          "  |  grey band = gene body, vertical lines = TSS and TES",
+          if (identical(input$enr_expected %||% "means", "legacy"))
+            "  |  legacy per-bin log ratios" else "  |  ratio of means"
+        )
       ) +
-      theme_bw(base_size = 13) +
-      theme(
-        strip.background = element_rect(fill = "#34495e"),
-        strip.text       = element_text(colour = "white", face = "bold"),
-        panel.grid.minor = element_blank(),
-        legend.position  = "top",
-        axis.text.x      = element_text(size = 8)
-      )
+      build_custom_theme(
+        title_size = input$enr_plot_title_size %||% 14,
+        axis_title_size = input$enr_plot_axis_title_size %||% 12,
+        axis_text_size = input$enr_plot_axis_text_size %||% 10,
+        legend_text_size = input$enr_plot_legend_size %||% 10,
+        line_width = input$enr_plot_line_width %||% 0.8
+      ) +
+      theme(legend.position = "top")
+    
+    if (!isTRUE(input$enr_plot_show_grid)) {
+      p <- p + theme(panel.grid.major = element_blank())
+    }
     p
   })
 
-  output$enrichment_plot <- renderPlot({ build_enrichment_plot() })
+  output$enrichment_plot <- renderPlot({ with_stack_trace(build_enrichment_plot(), "Enrichment Profile") })
 
   output$dl_enrichment_plot <- downloadHandler(
     filename = function() paste0("enrichment_profile_", Sys.Date(), ".pdf"),
     content  = function(file) {
-      ggsave(file, plot = build_enrichment_plot(),
+      ggplot2::ggsave(file, plot = build_enrichment_plot(),
              width = 14, height = 8, device = "pdf")
     }
   )
@@ -2133,8 +3037,12 @@ server <- function(input, output, session) {
       req(df)
       df_out <- df
       df_out$x_position <- df_out$slot / input$enr_n_bins
-      df_out <- df_out[, c("mark", "condition", "slot", "x_position",
-                           "mean_log_ratio", "n_genes")]
+      keep_cols <- intersect(
+        c("stage", "mark", "condition", "slot", "x_position",
+          "mean_log_ratio", "mean_value", "expected", "n_bins_avg", "n_genes",
+          "n_genes_distinct", "n_genes_total", "genes"),
+        colnames(df_out))
+      df_out <- df_out[, keep_cols, drop = FALSE]
       write.xlsx(df_out, file, overwrite = TRUE)
     }
   )
@@ -2259,7 +3167,9 @@ server <- function(input, output, session) {
           }
         }
         if (length(results) == 0) return(NULL)
-        bind_rows(results)
+        res_all <- bind_rows(results)
+        res_all$n_genes_used <- length(genes_sel)
+        res_all
       })
     })
   })
@@ -2269,7 +3179,15 @@ server <- function(input, output, session) {
     req(df)
 
     n_bins      <- input$n_bins
-    modes_sel   <- unique(df$ref_type)
+
+    # Reference panels follow the biology (TSS -> gene body -> TES) rather than
+    # the alphabetical order a bare character column would give.
+    ref_order   <- c("TSS", "gene_body", "TES")
+    present     <- unique(as.character(df$ref_type))
+    modes_sel   <- c(intersect(ref_order, present), setdiff(present, ref_order))
+    df$ref_type <- factor(as.character(df$ref_type), levels = modes_sel,
+                          labels = ifelse(modes_sel == "gene_body",
+                                          "Gene body", modes_sel))
     multi_ref   <- length(modes_sel) > 1
     multi_stage <- length(unique(df$stage)) > 1
 
@@ -2281,7 +3199,7 @@ server <- function(input, output, session) {
       } else if (m == "TES") {
         c(paste0("-", input$upstream / 1000, "kb"), "TES", paste0("+", input$downstream / 1000, "kb"))
       } else {
-        c("Start", "50%", "End")
+        c("TSS", "50% of gene", "TES")
       }
     }
 
@@ -2331,6 +3249,11 @@ server <- function(input, output, session) {
     if (multi_stage) {
       title_txt <- paste0(title_txt, "  |  ", paste(unique(df$stage), collapse = " vs "))
     }
+    if ("n_genes_used" %in% colnames(df)) {
+      title_txt <- paste0(title_txt, "  |  ",
+                          format(max(df$n_genes_used, na.rm = TRUE), big.mark = ","),
+                          " genes")
+    }
 
     pal <- condition_palette()
     p <- p +
@@ -2352,12 +3275,12 @@ server <- function(input, output, session) {
     p
   })
 
-  output$metagene_plot <- renderPlot({ build_metagene_plot() })
+  output$metagene_plot <- renderPlot({ apply_plot_customization(build_metagene_plot(), input, "mg_") })
 
   output$dl_metagene <- downloadHandler(
     filename = function() paste0("metagene_", Sys.Date(), ".pdf"),
     content  = function(file) {
-      ggsave(file, plot = build_metagene_plot(),
+      ggplot2::ggsave(file, plot = apply_plot_customization(build_metagene_plot(), input, "mg_"),
              width = 14, height = 10, device = "pdf")
     }
   )
@@ -2368,6 +3291,274 @@ server <- function(input, output, session) {
       df <- metagene_data()
       req(df)
       write.xlsx(df, file, overwrite = TRUE)
+    }
+  )
+
+
+  # ---- GENE CONTRIBUTIONS ----------------------------------------------------
+  # Breaks a metagene profile back down into its individual genes.
+
+  output$gc_stage_ui <- renderUI({
+    stages <- names(active_stages())
+    if (length(stages) < 2) return(NULL)
+    selectInput("gc_stage", "Stage", choices = stages, selected = stages[1])
+  })
+
+  output$gc_mark_ui <- renderUI({
+    marks <- all_marks_reactive()
+    req(length(marks) > 0)
+    selectInput("gc_mark", "Histone mark", choices = marks, selected = marks[1])
+  })
+
+  output$gc_condition_ui <- renderUI({
+    conds <- ordered_conditions()
+    req(length(conds) > 0)
+    selectInput("gc_condition", "Condition", choices = conds, selected = conds[1])
+  })
+
+  output$gene_selector_gc <- renderUI({
+    req(rv$genes)
+    nms <- gene_names_reactive()
+    tagList(
+      tags$small(style = "color:#888",
+        paste0(length(nms), " genes in the annotation — paste a list, one per row.")),
+      br(), br(),
+      tags$textarea(
+        id = "selected_genes_text_gc", rows = 10,
+        style = "width:100%; height:180px; font-family: monospace; font-size: 13px; resize: vertical;",
+        placeholder = "Paste gene IDs here, one per line…",
+        ""
+      )
+    )
+  })
+
+  gc_genes_selected <- reactive({
+    req(rv$genes)
+    if (!identical(input$gc_gene_scope, "selected")) return(rv$genes)
+    raw <- strsplit(input$selected_genes_text_gc %||% "", "[\r\n,;\t]+")[[1]]
+    raw <- trimws(raw); raw <- raw[nchar(raw) > 0]
+    nms <- gene_names_reactive()
+    sel <- raw[raw %in% nms]
+    if (length(sel) == 0) return(NULL)
+    rv$genes[nms %in% sel]
+  })
+
+  gc_data <- eventReactive(input$run_genecontrib, {
+    req(rv$hmm, rv$genes, input$gc_mark, input$gc_condition)
+
+    genes_sel <- gc_genes_selected()
+    if (is.null(genes_sel) || length(genes_sel) == 0) {
+      showNotification("No valid genes selected.", type = "error", duration = 8)
+      return(NULL)
+    }
+
+    stages <- active_stages()
+    st_nm  <- input$gc_stage %||% names(stages)[1]
+    st     <- stages[[st_nm]]
+    req(st)
+
+    if (!(input$gc_condition %in% st$conditions)) {
+      showNotification(
+        paste0("Condition \"", input$gc_condition, "\" is not present in ", st_nm, "."),
+        type = "error", duration = 10
+      )
+      return(NULL)
+    }
+
+    withProgress(message = paste0("Splitting profile across ", length(genes_sel), " genes…"), {
+      df <- compute_gene_contributions(
+        hmm        = st$hmm,
+        genes_gr   = genes_sel,
+        mark       = input$gc_mark,
+        condition  = input$gc_condition,
+        mode       = input$gc_mode,
+        upstream   = input$gc_upstream,
+        downstream = input$gc_downstream,
+        n_bins     = input$gc_n_bins
+      )
+      if (is.null(df) || nrow(df) == 0) {
+        showNotification("No bins overlapped the selected genes' windows.",
+                         type = "warning", duration = 10)
+        return(NULL)
+      }
+      df$stage <- st_nm
+
+      # Coordinates for every gene in the run, so the ranking table can say
+      # WHERE each contributing gene is, not just its name.
+      gi_df <- data.frame(
+        gene   = mcols(genes_sel)$gene_name,
+        chr    = as.character(seqnames(genes_sel)),
+        start  = start(genes_sel),
+        end    = end(genes_sel),
+        strand = as.character(strand(genes_sel)),
+        stringsAsFactors = FALSE
+      )
+      gi_df$TSS         <- ifelse(gi_df$strand == "-", gi_df$end,   gi_df$start)
+      gi_df$TES         <- ifelse(gi_df$strand == "-", gi_df$start, gi_df$end)
+      gi_df$gene_length <- gi_df$end - gi_df$start + 1
+      gi_df$locus       <- paste0(gi_df$chr, ":", gi_df$start, "-", gi_df$end)
+
+      list(profile = df, coords = gi_df)
+    })
+  })
+
+  # One row per gene: mean and peak signal in the window, share of the total.
+  gc_gene_summary <- reactive({
+    res <- gc_data(); req(res)
+    df  <- res$profile
+    out <- df %>%
+      dplyr::group_by(gene) %>%
+      dplyr::summarise(
+        mean_signal = mean(signal, na.rm = TRUE),
+        peak_signal = max(signal,  na.rm = TRUE),
+        peak_bin    = bin_idx[which.max(signal)],
+        n_bins      = dplyr::n(),
+        total       = sum(signal, na.rm = TRUE),
+        .groups     = "drop"
+      ) %>%
+      dplyr::arrange(desc(total))
+    grand <- sum(out$total, na.rm = TRUE)
+    out$pct_of_total     <- if (grand > 0) 100 * out$total / grand else NA_real_
+    out$cum_pct_of_total <- cumsum(out$pct_of_total)
+    out$rank             <- seq_len(nrow(out))
+
+    # Attach where each gene actually is
+    out <- dplyr::left_join(out, res$coords, by = "gene")
+    out[, c("rank", "gene", "chr", "start", "end", "strand", "TSS", "TES",
+            "gene_length", "locus", "mean_signal", "peak_signal", "peak_bin",
+            "n_bins", "total", "pct_of_total", "cum_pct_of_total")]
+  })
+
+  build_gc_heatmap <- reactive({
+    res <- gc_data(); req(res)
+    df  <- res$profile
+    sm  <- gc_gene_summary()
+
+    top_n <- min(nrow(sm), max(10, input$gc_top_n %||% 200))
+    keep  <- sm$gene[seq_len(top_n)]
+
+    d <- df[df$gene %in% keep, , drop = FALSE]
+    d$gene <- factor(d$gene, levels = rev(keep))   # strongest at the top
+
+    fill_val <- if (isTRUE(input$gc_log_scale)) log1p(d$signal) else d$signal
+    d$fill_val <- fill_val
+    cap <- stats::quantile(d$fill_val, 0.99, na.rm = TRUE)
+    d$fill_val <- pmin(d$fill_val, cap)
+
+    x_lab <- if (identical(input$gc_mode, "gene_body")) "TSS → TES (% of gene)" else
+             paste0("position relative to ", input$gc_mode)
+
+    ggplot(d, aes(x = bin_idx, y = gene, fill = fill_val)) +
+      geom_raster() +
+      scale_fill_viridis_c(
+        option = "magma", direction = -1,
+        name = if (isTRUE(input$gc_log_scale)) "log(1+RPKM)" else "RPKM"
+      ) +
+      scale_x_continuous(expand = c(0, 0)) +
+      labs(
+        x = x_lab, y = NULL,
+        title = paste0("Per-gene signal — ", input$gc_mark, " / ", input$gc_condition),
+        subtitle = paste0("top ", top_n, " of ", nrow(sm),
+                          " genes by total signal, strongest at the top")
+      ) +
+      theme_bw(base_size = 13) +
+      theme(
+        axis.text.y      = if (top_n <= 60) element_text(size = 6) else element_blank(),
+        axis.ticks.y     = element_blank(),
+        panel.grid       = element_blank(),
+        legend.position  = "right"
+      )
+  })
+
+  build_gc_cumulative <- reactive({
+    sm <- gc_gene_summary(); req(sm)
+    d  <- data.frame(
+      pct_genes  = 100 * sm$rank / nrow(sm),
+      pct_signal = sm$cum_pct_of_total
+    )
+    ggplot(d, aes(x = pct_genes, y = pct_signal)) +
+      geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey50") +
+      geom_line(linewidth = 1, colour = "#E63946") +
+      scale_x_continuous(limits = c(0, 100), expand = c(0, 0)) +
+      scale_y_continuous(limits = c(0, 100), expand = c(0, 0)) +
+      labs(
+        x = "% of genes (ranked strongest first)",
+        y = "% of total signal",
+        title = "Signal concentration across genes",
+        subtitle = "dashed line = every gene contributes equally"
+      ) +
+      theme_bw(base_size = 13) +
+      theme(panel.grid.minor = element_blank())
+  })
+
+  output$gc_heatmap    <- renderPlot({ apply_plot_customization(build_gc_heatmap(), input, "gc_") })
+  output$gc_cumulative <- renderPlot({ apply_plot_customization(build_gc_cumulative(), input, "gc_") })
+
+  output$gc_concentration_text <- renderUI({
+    sm <- gc_gene_summary(); req(sm)
+    n  <- nrow(sm)
+    at <- function(pct) {
+      k <- max(1L, ceiling(n * pct / 100))
+      round(sm$cum_pct_of_total[k], 1)
+    }
+    # Gini coefficient of the per-gene totals: 0 = perfectly even, 1 = one gene
+    x    <- sort(pmax(sm$total, 0))
+    gini <- if (sum(x) > 0) {
+      (2 * sum(seq_along(x) * x) / (length(x) * sum(x))) - (length(x) + 1) / length(x)
+    } else NA_real_
+
+    tagList(
+      br(),
+      tags$b("Top 1% of genes carry "), tags$b(paste0(at(1), "%")), " of the signal; ",
+      tags$b("top 10% carry "), tags$b(paste0(at(10), "%")), "; ",
+      tags$b("top 50% carry "), tags$b(paste0(at(50), "%")), ".",
+      br(),
+      tags$small(style = "color:#888",
+        paste0("Gini coefficient = ", round(gini, 3),
+               " (0 = every gene contributes equally, 1 = a single gene carries everything). ",
+               "Above ~0.6 the average profile is telling you about a minority of genes, ",
+               "so report the median gene or a heatmap alongside the mean line."))
+    )
+  })
+
+  output$gc_table <- renderDT({
+    sm <- gc_gene_summary(); req(sm)
+    out <- sm[, c("rank", "gene", "locus", "strand", "gene_length",
+                  "mean_signal", "peak_signal", "peak_bin",
+                  "pct_of_total", "cum_pct_of_total")]
+    out$mean_signal      <- round(out$mean_signal, 3)
+    out$peak_signal      <- round(out$peak_signal, 3)
+    out$pct_of_total     <- round(out$pct_of_total, 4)
+    out$cum_pct_of_total <- round(out$cum_pct_of_total, 2)
+    datatable(out, rownames = FALSE, filter = "top",
+              options = list(pageLength = 15, scrollX = TRUE))
+  })
+
+  output$dl_gc_heatmap <- downloadHandler(
+    filename = function() paste0("gene_contributions_heatmap_", Sys.Date(), ".pdf"),
+    content  = function(file) {
+      ggplot2::ggsave(file, build_gc_heatmap(), width = 10, height = 12, device = "pdf", limitsize = FALSE)
+    }
+  )
+
+  output$dl_gc_cumulative <- downloadHandler(
+    filename = function() paste0("gene_contributions_curve_", Sys.Date(), ".pdf"),
+    content  = function(file) {
+      ggplot2::ggsave(file, build_gc_cumulative(), width = 8, height = 6, device = "pdf")
+    }
+  )
+
+  output$dl_gc_xlsx <- downloadHandler(
+    filename = function() paste0("gene_contributions_", Sys.Date(), ".xlsx"),
+    content  = function(file) {
+      sm <- gc_gene_summary(); req(sm)
+      df <- gc_data()$profile
+      wide <- tidyr::pivot_wider(df[, c("gene", "bin_idx", "signal")],
+                                 names_from = bin_idx, values_from = signal,
+                                 names_prefix = "bin_")
+      write.xlsx(list(`gene ranking` = as.data.frame(sm),
+                      `per-gene matrix` = as.data.frame(wide)),
+                 file, overwrite = TRUE)
     }
   )
 
@@ -2543,12 +3734,12 @@ server <- function(input, output, session) {
     p
   })
 
-  output$browser_plot <- renderPlot({ build_browser_plot() })
+  output$browser_plot <- renderPlot({ apply_plot_customization(build_browser_plot(), input, "br_") })
 
   output$dl_browser <- downloadHandler(
     filename = function() paste0("region_browser_", Sys.Date(), ".pdf"),
     content  = function(file) {
-      ggsave(file, plot = build_browser_plot(),
+      ggplot2::ggsave(file, plot = apply_plot_customization(build_browser_plot(), input, "br_"),
              width = 16, height = 12, device = "pdf")
     }
   )
@@ -2624,6 +3815,22 @@ server <- function(input, output, session) {
       TES_1000_2000      = "TES 1000–2000bp",
       Intergenic         = "Intergenic"
     )
+
+    if (all(best_zone == "Intergenic")) {
+      # Nothing overlapped at all — almost always a chromosome-naming mismatch
+      # between the ChromstaR object and the gene table (e.g. "1" vs "chr1"),
+      # or coordinates from a different genome assembly.
+      showNotification(
+        paste0(
+          "Gene annotation matched 0 bins — every bin was labelled Intergenic. ",
+          "Check that the chromosome names agree. Object: ",
+          paste(utils::head(unique(as.character(seqnames(bins))), 3), collapse = ", "),
+          " | gene file: ",
+          paste(utils::head(unique(chr_g), 3), collapse = ", ")
+        ),
+        type = "warning", duration = 20
+      )
+    }
 
     data.frame(
       gene_name    = best_gene,
@@ -2768,7 +3975,8 @@ server <- function(input, output, session) {
 
   compute_differential_peaks <- function(hmm, marks, score_thresh, width_thresh,
                                          conds_sel = NULL, mode = "pairwise",
-                                         ref = NULL, stage_label = NULL) {
+                                         ref = NULL, stage_label = NULL,
+                                         genes_gr = NULL) {
 
     tag <- if (is.null(stage_label)) "" else paste0(" [", stage_label, "]")
 
@@ -2785,7 +3993,23 @@ server <- function(input, output, session) {
       return(NULL)
     }
 
-    segs_df <- as.data.frame(hmm$segments)
+    segs <- hmm$segments
+
+    # Optional gene scope: keep only segments overlapping the chosen genes.
+    if (!is.null(genes_gr) && length(genes_gr) > 0) {
+      keep_idx <- unique(queryHits(findOverlaps(segs, genes_gr, ignore.strand = TRUE)))
+      if (length(keep_idx) == 0) {
+        showNotification(
+          paste0("None of the selected genes overlap any chromatin segment", tag, "."),
+          type = "warning", duration = 12
+        )
+        return(NULL)
+      }
+      segs <- segs[keep_idx]
+      cat("Restricted to", length(genes_gr), "genes ->", length(segs), "segments\n")
+    }
+
+    segs_df <- as.data.frame(segs)
 
     cat("Segments:", nrow(segs_df), "rows\n")
 
@@ -2877,6 +4101,12 @@ server <- function(input, output, session) {
     # --------------------------------------------------------------------------
     results <- list()
 
+    # Segments that actually change state in at least one compared pair — i.e.
+    # exactly the set the bar chart is built from. With two conditions this is
+    # the single pair's count; with more, a segment counts once even if it
+    # changes in several pairs.
+    changed_union <- integer(0)
+
     for (pr in pairs) {
       a <- pr[1]
       b <- pr[2]
@@ -2885,6 +4115,7 @@ server <- function(input, output, session) {
       combo_b <- as.character(kept[[combination_cols[[b]]]])
 
       changed <- which(combo_a != combo_b)
+      changed_union <- union(changed_union, changed)
       cat("  ", a, "vs", b, "— segments changing state:", length(changed), "\n")
 
       if (length(changed) == 0) next
@@ -2920,8 +4151,11 @@ server <- function(input, output, session) {
 
     out <- dplyr::bind_rows(results)
 
-    attr(out, "total_filtered") <- nrow(kept)
-    attr(out, "conditions")     <- conds
+    cat("Differential regions used in the bar chart:", length(changed_union), "\n")
+
+    attr(out, "total_filtered")  <- nrow(kept)
+    attr(out, "n_differential")  <- length(changed_union)
+    attr(out, "conditions")      <- conds
 
     out
   }
@@ -2939,6 +4173,76 @@ server <- function(input, output, session) {
     conds <- conds[!is.na(conds)]
     ord   <- ordered_conditions()
     c(intersect(ord, conds), setdiff(conds, ord))
+  })
+
+  output$gene_selector_diff <- renderUI({
+    req(rv$genes)
+    nms <- gene_names_reactive()
+    tagList(
+      tags$small(style = "color:#888",
+        paste0(length(nms), " genes in the annotation — paste a list (one per row). ",
+               "Only chromatin segments overlapping these genes are counted.")),
+      br(), br(),
+      tags$textarea(
+        id = "selected_genes_text_diff",
+        rows = 10,
+        style = "width:100%; height:200px; font-family: monospace; font-size: 13px; resize: vertical;",
+        placeholder = "Paste gene IDs here, one per line…",
+        ""
+      ),
+      uiOutput("gene_match_summary_diff")
+    )
+  })
+
+  selected_genes_parsed_diff <- reactive({
+    req(input$selected_genes_text_diff)
+    raw <- strsplit(input$selected_genes_text_diff, "[\r\n,;\t]+")[[1]]
+    raw <- trimws(raw)
+    raw[nchar(raw) > 0]
+  })
+
+  output$gene_match_summary_diff <- renderUI({
+    req(rv$genes)
+    pasted <- selected_genes_parsed_diff()
+    if (length(pasted) == 0) {
+      return(tags$small(style = "color:#888", "No genes entered yet."))
+    }
+    nms       <- gene_names_reactive()
+    matched   <- pasted[pasted %in% nms]
+    unmatched <- setdiff(pasted, nms)
+    tagList(
+      br(),
+      tags$small(style = "color:#28a745",
+        paste0("\u2713 ", length(matched), " of ", length(pasted), " gene names matched.")),
+      if (length(unmatched) > 0) {
+        tags$div(tags$small(style = "color:#dc3545",
+          paste0("\u2717 ", length(unmatched), " not found, e.g.: ",
+                 paste(utils::head(unmatched, 5), collapse = ", "),
+                 if (length(unmatched) > 5) "\u2026" else "")))
+      }
+    )
+  })
+
+  observeEvent(input$select_all_genes_diff, {
+    req(rv$genes)
+    updateTextAreaInput(session, "selected_genes_text_diff",
+                        value = paste(gene_names_reactive(), collapse = "\n"))
+  })
+
+  observeEvent(input$clear_all_genes_diff, {
+    updateTextAreaInput(session, "selected_genes_text_diff", value = "")
+  })
+
+  # Genes the Differential Peaks tab should be restricted to — NULL means the
+  # whole genome (every segment), which is the default.
+  diff_genes_selected <- reactive({
+    if (!identical(input$diff_gene_scope, "selected")) return(NULL)
+    req(rv$genes)
+    nms <- gene_names_reactive()
+    sel <- selected_genes_parsed_diff()
+    sel <- sel[sel %in% nms]
+    if (length(sel) == 0) return(NULL)
+    rv$genes[nms %in% sel]
   })
 
   output$diff_condition_ui <- renderUI({
@@ -2979,6 +4283,16 @@ server <- function(input, output, session) {
                              diff_available_conditions())
     mode        <- input$diff_mode %||% "pairwise"
     ref         <- input$diff_ref
+    genes_gr    <- diff_genes_selected()
+
+    if (identical(input$diff_gene_scope, "selected") &&
+        (is.null(genes_gr) || length(genes_gr) == 0)) {
+      showNotification(
+        "Gene scope is \"Only selected genes\" but no valid gene names were entered.",
+        type = "error", duration = 8
+      )
+      return(NULL)
+    }
 
     if (length(conds_sel) < 2) {
       showNotification("Pick at least 2 conditions to compare.",
@@ -2998,13 +4312,15 @@ server <- function(input, output, session) {
             width_thresh = input$diff_width_thresh,
             conds_sel    = conds_sel,
             mode         = mode,
-            ref          = ref
+            ref          = ref,
+            genes_gr     = genes_gr
           )
           if (is.null(df)) return(NULL)
           # attr()s don't survive bind_rows() across stages, so carry the
           # per-stage bookkeeping (total filtered segments, which conditions
           # this stage actually contributed) as ordinary columns instead.
           df$total_filtered   <- attr(df, "total_filtered")
+          df$n_differential   <- attr(df, "n_differential")
           df$stage_conditions <- paste(attr(df, "conditions"), collapse = ", ")
           df
         })
@@ -3075,19 +4391,24 @@ server <- function(input, output, session) {
     names(fill_cols) <- prep$levels
     fill_cols[is.na(fill_cols)] <- "#9E9E9E"
 
-    info <- df %>% dplyr::distinct(stage, stage_conditions, total_filtered)
+    info <- df %>% dplyr::distinct(stage, stage_conditions, total_filtered, n_differential)
     mode_txt <- if (identical(input$diff_mode, "reference")) {
       paste0("reference = ", input$diff_ref)
     } else {
       "all pairwise"
     }
+    scope_txt <- if (identical(input$diff_gene_scope, "selected")) {
+      paste0(" | ", length(diff_genes_selected()), " selected genes")
+    } else {
+      " | whole genome"
+    }
 
     subtitle_txt <- paste0(
       paste0(info$stage, " (", info$stage_conditions, ", ",
-             format(info$total_filtered, big.mark = ","),
-             " segments pass filters)", collapse = "   |   "),
+             format(info$n_differential, big.mark = ","),
+             " differential regions)", collapse = "   |   "),
       "\nscore>=", input$diff_score_thresh,
-      ", width>=", input$diff_width_thresh, "bp | ", mode_txt
+      ", width>=", input$diff_width_thresh, "bp | ", mode_txt, scope_txt
     )
 
     p <- ggplot(df, aes(x = mark, y = n_regions, fill = present_in)) +
@@ -3139,7 +4460,7 @@ server <- function(input, output, session) {
   })
 
   output$diffpeaks_plot <- renderPlot({
-    build_diffpeaks_plot()
+    apply_plot_customization(build_diffpeaks_plot(), input, "dp_")
   })
 
   output$dl_diffpeaks_plot <- downloadHandler(
@@ -3148,7 +4469,7 @@ server <- function(input, output, session) {
     },
     content = function(file) {
       h <- tryCatch(diffpeaks_plot_height() / 70, error = function(e) 7)
-      ggsave(file, build_diffpeaks_plot(),
+      ggplot2::ggsave(file, apply_plot_customization(build_diffpeaks_plot(), input, "dp_"),
              width = 12, height = max(7, min(30, h)), device = "pdf", limitsize = FALSE)
     }
   )
@@ -3161,6 +4482,185 @@ server <- function(input, output, session) {
       df <- diffpeaks_data()
       req(df)
       openxlsx::write.xlsx(df, file, overwrite = TRUE)
+    }
+  )
+
+  # ---- Per-mark summary + ranked figures (Differential Peaks tab) ------------
+  # Built from the same differential regions the bar chart uses, so every
+  # percentage here has n_differential as its denominator.
+  diffpeaks_mark_summary <- reactive({
+    df <- diffpeaks_data()
+    req(df)
+    rows <- list()
+    for (st in unique(as.character(df$stage))) {
+      sdf   <- df[as.character(df$stage) == st, , drop = FALSE]
+      ndiff <- suppressWarnings(max(sdf$n_differential, na.rm = TRUE))
+      if (!is.finite(ndiff) || ndiff <= 0) next
+      for (cmp in unique(as.character(sdf$comparison))) {
+        cdf <- sdf[as.character(sdf$comparison) == cmp, , drop = FALSE]
+        a_c <- sub(" vs .*$", "", cmp)
+        b_c <- sub("^.* vs ", "", cmp)
+        for (m in unique(as.character(cdf$mark))) {
+          mdf    <- cdf[as.character(cdf$mark) == m, , drop = FALSE]
+          gained <- sum(mdf$n_regions[as.character(mdf$present_in) == b_c], na.rm = TRUE)
+          lost   <- sum(mdf$n_regions[as.character(mdf$present_in) == a_c], na.rm = TRUE)
+          rows[[length(rows) + 1L]] <- data.frame(
+            stage          = st,
+            comparison     = cmp,
+            mark           = m,
+            gained         = gained,
+            lost           = lost,
+            total_changed  = gained + lost,
+            n_differential = ndiff,
+            cond_a         = a_c,
+            cond_b         = b_c,
+            stringsAsFactors = FALSE)
+        }
+      }
+    }
+    if (length(rows) == 0) return(NULL)
+    out <- dplyr::bind_rows(rows)
+    out$pct_changed <- round(out$total_changed / out$n_differential * 100, 2)
+    out$pct_gained  <- round(out$gained        / out$n_differential * 100, 2)
+    out$pct_lost    <- round(out$lost          / out$n_differential * 100, 2)
+    out$direction   <- ifelse(out$gained > out$lost,
+                              paste0("Gained in ", out$cond_b),
+                              paste0("Lost in ",   out$cond_b))
+    out$panel       <- paste0(out$stage, " — ", out$comparison)
+    out[order(out$stage, out$comparison, -out$total_changed), ]
+  })
+
+  # Spells out why the per-mark percentages sum to more than 100%.
+  output$diffpeaks_overlap_note <- renderUI({
+    out <- diffpeaks_mark_summary()
+    req(out)
+    parts <- vapply(split(out, out$panel, drop = TRUE), function(g) {
+      sprintf("%s: %.2f marks change per differential region",
+              g$panel[1], sum(g$total_changed) / g$n_differential[1])
+    }, character(1))
+    tags$div(style = "color:#555; font-size:12px; line-height:1.5;",
+      tags$b("These percentages overlap and will not sum to 100%. "),
+      "Most differential regions have several marks changing at once, and a region is counted once for every mark that changes in it. ",
+      tags$br(), paste(parts, collapse = "   |   "))
+  })
+
+  output$diffpeaks_mark_table <- renderDT({
+    out <- diffpeaks_mark_summary()
+    req(out)
+    disp <- out[, c("stage", "comparison", "mark", "gained", "lost",
+                    "total_changed", "pct_gained", "pct_lost", "pct_changed",
+                    "n_differential", "direction")]
+    names(disp) <- c("Stage", "Comparison", "Mark", "Gained", "Lost",
+                     "Total changed", "% gained", "% lost", "% of differential",
+                     "Differential regions", "Direction")
+    DT::datatable(disp, rownames = FALSE,
+                  options = list(pageLength = 16, dom = "tip", scrollX = TRUE))
+  })
+
+  output$dl_diffpeaks_mark_table <- downloadHandler(
+    filename = function() paste0("differential_peaks_per_mark_", Sys.Date(), ".xlsx"),
+    content  = function(file) {
+      out <- diffpeaks_mark_summary()
+      req(out)
+      openxlsx::write.xlsx(out[, setdiff(colnames(out), "panel")], file, overwrite = TRUE)
+    }
+  )
+
+  # ---- Ranked figure: filtered differential regions --------------------------
+  build_diffpeaks_rank_filtered <- reactive({
+    out <- diffpeaks_mark_summary()
+    req(out)
+    nd <- format(max(out$n_differential, na.rm = TRUE), big.mark = ",")
+    mark_ranking_ggplot(
+      out,
+      title    = "Histone Marks Ranked by Magnitude of Change",
+      subtitle = paste0("Differential regions only (score/width filtered) | n = ", nd),
+      ylab        = "Differential Regions Changed",
+      style       = input$dp_rank_style %||% "stacked",
+      cond_colors = condition_palette())
+  })
+
+  output$diffpeaks_rank_filtered <- renderPlot({
+    apply_plot_customization(build_diffpeaks_rank_filtered(), input, "dp_")
+  })
+
+  output$dl_diffpeaks_rank_filtered <- downloadHandler(
+    filename = function() paste0("marks_ranked_differential_", Sys.Date(), ".pdf"),
+    content  = function(file) {
+      ggplot2::ggsave(file,
+        apply_plot_customization(build_diffpeaks_rank_filtered(), input, "dp_"),
+        width = 10, height = 6, device = "pdf")
+    }
+  )
+
+  # ---- Ranked figure: genome-wide, from the $frequencies table ---------------
+  diffpeaks_pairs_for <- function(conds) {
+    if (identical(input$diff_mode, "reference")) {
+      r <- if (!is.null(input$diff_ref) && input$diff_ref %in% conds) input$diff_ref else conds[1]
+      lapply(setdiff(conds, r), function(o) c(r, o))
+    } else {
+      utils::combn(conds, 2, simplify = FALSE)
+    }
+  }
+
+  diffpeaks_rank_genome_data <- reactive({
+    stages <- active_stages()
+    sel    <- resolve_selected_stages(input$stages_diffpeaks)
+    req(length(sel) > 0)
+    rows <- list(); missing_freq <- character(0)
+    for (nm in sel) {
+      st <- stages[[nm]]
+      if (is.null(st)) next
+      fq <- tryCatch(st$hmm$frequencies, error = function(e) NULL)
+      if (is.null(fq)) { missing_freq <- c(missing_freq, nm); next }
+      conds <- stage_conditions_kept(st)
+      if (length(conds) < 2) next
+      for (pr in diffpeaks_pairs_for(conds)) {
+        rk <- compute_mark_ranking_freq(fq, st$marks, pr[1], pr[2])
+        if (is.null(rk)) next
+        rk$stage      <- nm
+        rk$comparison <- paste0(pr[1], " vs ", pr[2])
+        rk$panel      <- paste0(nm, " — ", rk$comparison)
+        rows[[length(rows) + 1L]] <- rk
+      }
+    }
+    list(data    = if (length(rows)) dplyr::bind_rows(rows) else NULL,
+         missing = missing_freq)
+  })
+
+  output$diffpeaks_rank_genome_note <- renderUI({
+    r <- diffpeaks_rank_genome_data()
+    if (length(r$missing) == 0) return(NULL)
+    tags$div(style = "color:#b8860b; font-size:12px; margin-bottom:8px;",
+      tags$b("No combination-frequency table found for: "),
+      paste(r$missing, collapse = ", "), ". ",
+      "This genome-wide view reads the object's $frequencies slot. Re-load the chromstaR object with this version of the app — earlier versions discarded that slot when trimming the object for memory.")
+  })
+
+  build_diffpeaks_rank_genome <- reactive({
+    r <- diffpeaks_rank_genome_data()
+    d <- r$data
+    req(!is.null(d), nrow(d) > 0)
+    tot <- format(max(d$total_domains, na.rm = TRUE), big.mark = ",")
+    mark_ranking_ggplot(
+      d,
+      title    = "Histone Marks Ranked by Magnitude of Change",
+      subtitle = paste0("Genome-wide, unfiltered | Total domains = ", tot),
+      ylab        = "Total Domains Changed",
+      style       = input$dp_rank_style %||% "stacked",
+      cond_colors = condition_palette())
+  })
+
+  output$diffpeaks_rank_genome <- renderPlot({
+    apply_plot_customization(build_diffpeaks_rank_genome(), input, "dp_")
+  })
+
+  output$dl_diffpeaks_rank_genome <- downloadHandler(
+    filename = function() paste0("marks_ranked_genomewide_", Sys.Date(), ".pdf"),
+    content  = function(file) {
+      ggplot2::ggsave(file,
+        apply_plot_customization(build_diffpeaks_rank_genome(), input, "dp_"),
+        width = 10, height = 6, device = "pdf")
     }
   )
 
@@ -3436,12 +4936,12 @@ server <- function(input, output, session) {
     p
   })
 
-  output$gsc_boxplot <- renderPlot({ build_gsc_plot() })
+  output$gsc_boxplot <- renderPlot({ apply_plot_customization(build_gsc_plot(), input, "gsc_") })
 
   output$dl_gsc_plot <- downloadHandler(
     filename = function() paste0("gene_set_comparison_", Sys.Date(), ".pdf"),
     content  = function(file) {
-      ggsave(file, plot = build_gsc_plot(), width = 12, height = 8, device = "pdf")
+      ggplot2::ggsave(file, plot = apply_plot_customization(build_gsc_plot(), input, "gsc_"), width = 12, height = 8, device = "pdf")
     }
   )
 
