@@ -2,7 +2,7 @@
 
 An interactive Shiny application for exploring chromatin state analyses of ChIP-seq data.
 
-ChromstaR Viewer opens a ChromstaR combined model (the object produced by the [chromstaR](https://bioconductor.org/packages/chromstaR/) Bioconductor package or by the Galaxy chromstaR workflow) and turns it into interactive figures and tables without writing R code. Everything is computed live from the object you upload. Nothing is precomputed or cached between sessions, except the optional saved RF + SHAP runs described below.
+ChromstaR Viewer opens a ChromstaR combined model (the object produced by the [chromstaR](https://bioconductor.org/packages/3.20/bioc/html/chromstaR.html/) Bioconductor package or by the Galaxy chromstaR workflow) and turns it into interactive figures and tables without writing R code. Everything is computed live from the object you upload. Nothing is precomputed or cached between sessions, except the optional saved RF + SHAP runs described below.
 
 Developed for *Echinococcus multilocularis* epigenomics (8 histone modifications), but it works with any chromstaR combined model that uses the same mark set or a compatible one.
 
