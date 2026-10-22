@@ -27,6 +27,7 @@ Developed for *Echinococcus multilocularis* epigenomics (8 histone modifications
 - [Bivalent](#bivalent)
 - [Region Browser](#region-browser)
 - [Differential Peaks](#differential-peaks)
+- [Volcano](#volcano)
 - [Gene Set Comparison](#gene-set-comparison)
 - [Mark Combinations](#mark-combinations)
 - [RF Region Model](#rf-region-model)
@@ -55,6 +56,7 @@ Two datasets can be loaded at once, called **Stage A** and **Stage B**, so two i
 | **Bivalent** | Do two or more marks co-occur on the same bins, and which genes carry that combination in each condition? |
 | **Region Browser** | What does the raw signal look like at one locus or chromosome? |
 | **Differential Peaks** | Which marks change between conditions, in which direction, and in how many regions? |
+| **Volcano** | Which genes carry a chosen mark combination, and how do they sit on the differential expression volcano plot? **[à vérifier]** |
 | **Gene Set Comparison** | Does my gene list differ from a random background, a matched background, or a second list? |
 | **Mark Combinations** | Which exact sets of marks do genes carry at their promoter or across the gene body? |
 | **RF Region Model** | How well do the marks at eight positions along a gene predict its expression? |
@@ -68,15 +70,16 @@ Two datasets can be loaded at once, called **Stage A** and **Stage B**, so two i
 
 ## Files you need
 
-Keep these three files in the same folder:
+Keep these files in the same folder:
 
 | File | Role |
 |---|---|
-| `app_v29.R` | The Shiny app. Run this. |
+| `app_v29.R` | The Shiny app. Run this. **[à vérifier : nom du fichier actuel]** |
 | `rf_shap_tools.R` | RF + SHAP engine: region windows, feature table, models, SHAP, figures, output files. Sourced by the app at startup. |
 | `rf_shap_extra.R` | Saving and loading RF + SHAP runs, cross-stage prediction, %IncMSE, correlated-pair tables, methods text, and extra figures. Sourced by the app at startup. |
+| `volcano_tools.R` | Volcano tab: mark-combination gene sets and overlay on Wald results. Sourced by the app at startup. |
 
-Both `rf_shap_*.R` files are required. The app stops at startup if either is missing.
+All three `.R` helper files are required. The app stops at startup if any of them is missing.
 
 Optional, for testing: `make_test_data.R` (see [Test data](#test-data)).
 
@@ -128,6 +131,7 @@ This writes a folder `test_data/` containing:
 | `genes.tsv` | Gene annotation with strand, for 4 placed chromosomes and 3 unplaced contigs |
 | `normalised_counts.tsv` | Normalised expression, genes × samples |
 | `colData.xlsx` | Sample sheet with `SampleName` and `Condition` |
+| `wald_<comparison>.tsv` | Synthetic Wald results (log2FC, padj) for the Volcano tab **[à vérifier : nom exact généré]** |
 
 The data is **synthetic**. It exercises every tab but does not represent real biology, so use it to check that the app runs and that figures look sensible, not to draw conclusions. In particular, Differential Peaks counts are not realistic estimates.
 
@@ -146,16 +150,18 @@ What the test data is designed to show:
 shiny::runApp("app_v29.R")
 ```
 
-Keep `rf_shap_tools.R` and `rf_shap_extra.R` in the same folder as the app. The app sources both at startup, and it is started from that folder.
+Keep `rf_shap_tools.R`, `rf_shap_extra.R` and `volcano_tools.R` in the same folder as the app. The app sources them at startup, and it is started from that folder.
 
 On startup a banner is printed to the R console. Check it whenever behaviour does not match this document. It confirms which build is running and which package `margin()` resolves to:
 
 ```
 ---------------------------------------------------------------
-ChromstaR Viewer build: <date> / v29: RF + SHAP region model tabs
+ChromstaR Viewer build: <date> / v30: Volcano tab
 margin() resolves to: ggplot2   (must be 'ggplot2')
 ---------------------------------------------------------------
 ```
+
+**[à vérifier : libellé exact de la bannière]**
 
 A first session using the test data:
 
@@ -168,6 +174,7 @@ A first session using the test data:
 7. Go to **Bivalent**, tick H3K4me3 and H3K27me3, and press **Compute Bivalent Analysis**. The gene table should show the planted genes in PNA.
 8. Go to **RF Region Model**, choose two conditions, set "Test genes to explain" to 2000, and press **Run RF + SHAP**.
 9. Go to **Differential Peaks**, press **Compute Differential Peaks**, and read the per-mark summary table before interpreting any figure.
+10. Go to **Volcano**, upload the Wald results for a comparison, choose a mark combination and condition, and press **Compute Volcano**.
 
 When you start with your own data, follow the same steps in the same order.
 
@@ -189,7 +196,7 @@ To keep memory use manageable the app keeps five slots and discards the rest. If
 
 | Slot | What it holds | Which tabs need it |
 |---|---|---|
-| `bins` | Genomic bins with RPKM signal, posteriors and per-condition state combination | Metagene, Gene Contributions, Expression Deciles, Enrichment, Bivalent, Region Browser, Data Table, Gene Set Comparison, Mark Combinations, RF Region Model |
+| `bins` | Genomic bins with RPKM signal, posteriors and per-condition state combination | Metagene, Gene Contributions, Expression Deciles, Enrichment, Bivalent, Region Browser, Data Table, Gene Set Comparison, Mark Combinations, RF Region Model, Volcano |
 | `segments` | Merged chromatin domains with `differential.score`, `width` and combination per condition | Differential Peaks |
 | `frequencies` | Domain counts for each unique pair of state combinations | Genome-wide ranked figure on Differential Peaks |
 | `info` | Sample metadata: mark, condition, replicate | Automatic detection of marks and conditions on load |
@@ -210,7 +217,7 @@ e.g.  counts.rpkm.H3K4me3.Meta.rep1
 
 Replicate suffixes are optional. Replicates are averaged per bin.
 
-In `segments`, `frequencies`, and `bins` (for the Bivalent and Mark Combinations tabs):
+In `segments`, `frequencies`, and `bins` (for the Bivalent, Mark Combinations and Volcano tabs):
 
 ```
 combination.<CONDITION>
@@ -228,7 +235,7 @@ Stage A is required, Stage B optional. Each has a free-text label used in figure
 
 ## Input file 2: the gene annotation table
 
-Supplies gene coordinates. Optional for the Region Browser and the Data Table. **Required** for every gene-anchored analysis (metagene, gene contributions, expression deciles, enrichment, bivalent, gene set comparison, mark combinations, RF Region Model).
+Supplies gene coordinates. Optional for the Region Browser and the Data Table. **Required** for every gene-anchored analysis (metagene, gene contributions, expression deciles, enrichment, bivalent, gene set comparison, mark combinations, RF Region Model, Volcano).
 
 ### It must be a delimited table with a header, not a GTF
 
@@ -308,6 +315,10 @@ The **unit** of the table is chosen on the Load Data tab before you upload the t
 
 The app warns if every value is a whole number, which suggests raw counts. Raw counts are not comparable between samples.
 
+### Wald results (Volcano tab)
+
+One table per comparison and stage, with one row per gene: gene identifier, `log2FoldChange` and `padj`. Comma-, tab- or semicolon-separated. Gene identifiers must match `gene_id` or `gene_name` in the annotation. **[à vérifier : noms de colonnes acceptés]**
+
 ---
 
 ## The Load Data tab
@@ -340,7 +351,7 @@ In ranked figures each half of a bar means "the mark is present in this conditio
 
 ### The Compute button, and why nothing updates without it
 
-Every analysis tab has a button such as **Compute Profile**, **Compute Enrichment**, **Load Region**, **Compute Bivalent Analysis**, **Compute Differential Peaks**, **Run RF + SHAP** or **Compute Combinations**. These analyses intersect whole-genome bin tables with gene annotations and can take from seconds to several minutes, so the app deliberately does not recompute when a setting changes.
+Every analysis tab has a button such as **Compute Profile**, **Compute Enrichment**, **Load Region**, **Compute Bivalent Analysis**, **Compute Differential Peaks**, **Compute Volcano**, **Run RF + SHAP** or **Compute Combinations**. These analyses intersect whole-genome bin tables with gene annotations and can take from seconds to several minutes, so the app deliberately does not recompute when a setting changes.
 
 > [!NOTE]
 > Changing a setting and then looking at the plot shows you the **old** result. This includes the appearance sliders. After any change, press the tab's Compute button again.
@@ -515,15 +526,23 @@ The quantitative core: which marks change between conditions, in which direction
 Filtering happens in two steps:
 
 1. Segments are kept if their differential score **and** width pass the thresholds.
-2. Of those, only segments whose chromatin state actually **differs** between the two conditions are retained. These are the *differential regions* everything on the tab is built from.
+2. Of those, only segments whose chromatin state actually **differs** between the two conditions are retained. These are the *differential regions*.
 
-The two counts are usually almost identical but need not be. A segment can accumulate enough total difference to pass the score threshold without any single mark crossing the boundary that defines its state. Such a segment is correctly excluded. **The figure caption reports the number of differential regions, the number the bars are built from.**
+The two counts are usually almost identical but need not be. A segment can accumulate enough total difference to pass the score threshold without any single mark crossing the boundary that defines its state. Such a segment is correctly excluded.
+
+The subtitle reports two numbers:
+
+- **N differential regions**: the chromatin segments that change state between the two conditions.
+- **M mark changes**: the bars on the figure sum to this number. It counts each mark that changes within each region, so **M is larger than N** whenever a region changes more than one mark. In this data, about 2 marks change per region on average.
+
+> [!NOTE]
+> The bars are built from mark changes, not from regions. A region where three marks change adds three to the bars. This is why the bars do not sum to the region count.
 
 ### Outputs
 
-- **Differential Peaks per Histone Mark**: grouped bars, one pair per mark, giving the number of regions where the mark is present in one condition and absent in the other, in each direction.
+- **Differential Peaks per Histone Mark**: grouped bars, one pair per mark, giving the number of mark changes in each direction, per comparison.
 - **Per-mark summary table**: Gained, Lost and Total changed for each mark, each with its own percentage, plus the direction label.
-- **Differential regions by genomic zone**: counts per zone (TSS, gene body, upstream, TES, intergenic).
+- **Differential regions by genomic zone**: counts per zone (TSS, gene body, upstream, TES, intergenic). The zone counts sum to the number of changed segments, each counted once.
 - **Marks ranked by change, differential regions**: marks ranked by how many differential regions they change in, each bar split into gained and lost.
 - **Marks ranked by change, genome-wide**: the same ranking across every domain in the genome, with no score or width filter, from the object's frequency table. Percentages here are of all domains and are **not** comparable with the filtered figure. This panel needs the `frequencies` slot.
 
@@ -536,6 +555,37 @@ The two counts are usually almost identical but need not be. A segment can accum
 > **The percentages overlap and will not sum to 100%.** Most differential regions have several marks changing at once, and each region is counted once for every mark that changes in it. The note above the summary table reports the mean number of marks changing per region for your data.
 
 **Buttons:** *Download Plot* (PDF, and Excel) · *Download Data (Excel)* · *Download Table (Excel)* · *Download all differential regions (CSV)*, one row per region, with coordinates, the state in each condition, the marks that changed, and the gene and zone when annotation is loaded.
+
+---
+
+## Volcano
+
+**[à vérifier : tout ce tab, à confirmer avec le code de `volcano_tools.R`]**
+
+Overlays a gene set defined by a mark combination on a volcano plot of differential expression (Wald results: log2 fold change against adjusted p-value). Use it to ask whether genes that gain, lose or keep a chromatin state also show the expected expression change.
+
+| Control | Purpose |
+|---|---|
+| Stage | Stage A or Stage B |
+| Condition | The condition in which the mark combination is read |
+| Mark combination | The marks defining the set |
+| Membership | **Present**: genes carrying the combination in that condition. **Only in**: genes carrying it and no other combination. **Gained**: genes carrying it in this condition but not in the previous one in the life-cycle order. **Lost**: genes carrying it in the previous condition but not in this one |
+| Wald results | One table per comparison and stage (see [Wald results](#wald-results-volcano-tab)) |
+| Significance threshold | Adjusted p-value cut-off used for colouring and counting |
+| **Compute Volcano** | Runs the analysis |
+
+**Outputs:**
+
+- The volcano plot, with genes in the chosen set highlighted over the background of all tested genes. **[à vérifier : couleurs et seuils par défaut]**
+- A count of genes in the set, how many pass the significance threshold, and how many go up or down.
+- A per-gene table for the set, with log2 fold change, adjusted p-value and the mark-combination membership.
+
+Membership is read from the same promoter window as the Bivalent tab. **[à vérifier]**
+
+**Buttons:** *Download Plot (PDF)* · *Download Data (Excel)*.
+
+> [!NOTE]
+> The volcano plot shows differential expression. The mark combination shows chromatin state. An association is a correlation between the two, not evidence that the mark causes the expression change.
 
 ---
 
@@ -748,6 +798,7 @@ Each bin is annotated with the gene and genomic zone it falls into, and with whe
 | Differential Peaks | Download Table (Excel) | Per-mark gained, lost, totals and percentages |
 | Differential Peaks | Download all differential regions (CSV) | One row per differential region |
 | Differential Peaks | Download Plot (PDF) ×2 | Filtered and genome-wide ranked figures |
+| Volcano | Download Plot (PDF) / Data (Excel) | Volcano plot; gene set with statistics **[à vérifier]** |
 | Gene Set Comparison | Download Plot / Data (Excel) | PDF of the box plot; statistics, per-gene posteriors and settings |
 | Mark Combinations | Download Plot (PNG) | UpSet-style figure |
 | RF Region Model | Download all outputs (zip) | CSV tables, fitted models (RDS), methods text and PDF figures |
@@ -760,7 +811,7 @@ PDF exports honour the current Plot Appearance settings.
 ## Troubleshooting
 
 ### The app stops at startup, saying a file cannot be found
-Both `rf_shap_tools.R` and `rf_shap_extra.R` must be in the same folder as `app_v29.R`, and the app must be started from that folder. Copy all three files together.
+`rf_shap_tools.R`, `rf_shap_extra.R` and `volcano_tools.R` must be in the same folder as the app, and the app must be started from that folder. Copy all the files together.
 
 ### A figure fails with an error mentioning a missing argument
 If a plot area shows something like `argument "observed" is missing, with no default`, another package attached in your R session is masking a function the app uses. The known case is **randomForest**, which exports its own `margin()`.
@@ -775,6 +826,9 @@ The gene IDs in the count table do not match `gene_id` or `gene_name` in the ann
 
 ### The RF tab says fewer than 50 genes are left
 Usually the count table or the annotation is wrong, or the expression floor is removing most genes. Check the count-table summary on the Load Data tab, and the chromosome naming in the annotation.
+
+### The Volcano tab finds few or no genes in the set
+The mark combination may not occur in the chosen condition, or the gene identifiers in the Wald table do not match the annotation. Check the match count in the summary. **[à vérifier]**
 
 ### The genome-wide ranked figure shows a note instead of a plot
 The object was loaded by an older build that discarded the `frequencies` slot. Re-upload the ChromstaR object. No other change is needed.
@@ -795,9 +849,9 @@ Whole-genome operations scale with the number of genes and bins. Narrow the gene
 
 ## Author
 
-**Janan Gawra**, IHPE (UMR 5244, CNRS, Université de Perpignan Via Domitia)
+**Janan Gawra**, IHPE (Interactions Hôtes-Pathogènes-Environnements, UMR 5244 CNRS-IFREMER-UM-UPVD)
 
-Application build v29.
+Application build v30.
 
 Built for chromatin and epigenomics analysis by Janan Gawra.
 [linkedin.com/in/janangawra](https://linkedin.com/in/janangawra)
