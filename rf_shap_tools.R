@@ -40,11 +40,17 @@ rs_make_regions <- function(genes) {
     TES1k   = cbind(L, L + 1000),
     TES2k   = cbind(L + 1000, L + 2000))
   out <- lapply(RS_KEYS, function(k) {
-    b  <- bounds[[k]]
-    a1 <- tss + sgn * b[, 1]
-    a2 <- tss + sgn * b[, 2]
-    GRanges(seqnames(genes), IRanges(pmin(a1, a2), pmax(a1, a2)),
-            key = k, gene = as.character(genes$gene_id))
+    b   <- bounds[[k]]
+    a1  <- floor(tss + sgn * b[, 1])
+    a2  <- floor(tss + sgn * b[, 2])
+    lo  <- pmin(a1, a2)
+    hi  <- pmax(a1, a2)
+    win_len <- hi - lo + 1                 # full window length, before clipping
+    keep <- hi >= 1                        # drop windows entirely before contig start
+    GRanges(seqnames(genes)[keep],
+            IRanges(pmax(lo[keep], 1), hi[keep]),
+            key = k, gene = as.character(genes$gene_id)[keep],
+            win_len = as.numeric(win_len[keep]))
   })
   unlist(GRangesList(out))
 }
@@ -77,19 +83,26 @@ rs_signal_matrix <- function(bins_df, cond, marks) {
 }
 
 # ---- 3. Genes x (mark__region) matrix, overlap-weighted ----------------------
-rs_region_matrix <- function(bins, sig, regions, marks) {
+rs_region_matrix <- function(bins, sig, regions, marks, min_cover = 0.5) {
   ov <- findOverlaps(regions, bins)
   q  <- queryHits(ov)
   s  <- subjectHits(ov)
-  w  <- width(pintersect(regions[q], bins[s]))
-  contrib <- sig[s, , drop = FALSE] * (w / width(bins)[s])
-  grp  <- paste(regions$gene[q], regions$key[q], sep = "|")
-  agg  <- rowsum(contrib, grp)
+  w  <- width(pintersect(regions[q], bins[s]))      # bases of the window inside this bin
+  contrib <- sig[s, , drop = FALSE] * w              # signal x bases
+  grp     <- paste(regions$gene[q], regions$key[q], sep = "|")
+  agg     <- rowsum(contrib, grp)
+  covered <- rowsum(w, grp)[, 1]
+  agg     <- agg / covered[rownames(agg)]            # mean signal per covered base
+  # fraction of each window that has bins under it; too little coverage -> NA
+  all_grp <- paste(regions$gene, regions$key, sep = "|")
+  win_len <- setNames(regions$win_len, all_grp)[!duplicated(all_grp)]
+  frac    <- covered / win_len[rownames(agg)]
+  agg[frac < min_cover, ] <- NA
   keys <- do.call(rbind, strsplit(rownames(agg), "|", fixed = TRUE))
   genes_all <- unique(as.character(regions$gene))
   cn <- paste(rep(marks, times = length(RS_KEYS)),
               rep(RS_KEYS, each = length(marks)), sep = "__")
-  M  <- matrix(0, length(genes_all), length(cn), dimnames = list(genes_all, cn))
+  M  <- matrix(NA_real_, length(genes_all), length(cn), dimnames = list(genes_all, cn))
   gi <- match(keys[, 1], genes_all)
   for (k in RS_KEYS) {
     rows <- keys[, 2] == k
@@ -115,8 +128,10 @@ rs_gene_expr <- function(genes, ct_mat, samples) {
 }
 
 rs_expr <- function(genes, ct, samples) {
-  v <- rs_gene_expr(genes, ct$mat, samples)
-  setNames(log2(v + 1), as.character(mcols(genes)$gene_id))
+  v   <- rs_gene_expr(genes, ct$mat, samples)
+  out <- setNames(log2(v + 1), as.character(mcols(genes)$gene_id))
+  attr(out, "unit") <- if (is.null(ct$unit)) "FPKM" else ct$unit
+  out
 }
 
 # ---- 5. One condition's feature table ----------------------------------------
@@ -124,6 +139,11 @@ rs_build_table <- function(hmm, cond, marks, regions, expr_named) {
   bins_df <- rs_bin_table(hmm)
   sig     <- rs_signal_matrix(bins_df, cond, marks)
   rm(bins_df)
+  missing_marks <- setdiff(RS_MARKS, colnames(sig))
+  if (length(missing_marks) > 0)
+    stop("'", cond, "' has no counts.rpkm columns for: ",
+         paste(missing_marks, collapse = ", "),
+         ". The region model needs all eight marks in every stage it compares.")
   M <- rs_region_matrix(hmm$bins, sig, regions, colnames(sig))
   g <- intersect(rownames(M), names(expr_named))
   if (length(g) == 0)
@@ -131,7 +151,12 @@ rs_build_table <- function(hmm, cond, marks, regions, expr_named) {
          "Check that gene IDs match the count table row names.")
   d <- data.frame(M[g, , drop = FALSE], rpkm = unname(expr_named[g]),
                   check.names = FALSE)
-  d[!is.na(d$rpkm), , drop = FALSE]
+  d <- d[!is.na(d$rpkm), , drop = FALSE]
+  keep <- stats::complete.cases(d[, colnames(M), drop = FALSE])
+  d <- d[keep, , drop = FALSE]
+  attr(d, "dropped_no_bins") <- sum(!keep)
+  attr(d, "unit") <- attr(expr_named, "unit")
+  d
 }
 
 # ---- 6. Cross-validation on the training set ---------------------------------
@@ -153,6 +178,8 @@ rs_cv <- function(tr, k, ntree, seed) {
 # ---- 7. Fit one condition: outliers, split, models, CV, SHAP -----------------
 rs_fit <- function(d, label, cfg, progress = function(m) NULL) {
   feats <- setdiff(names(d), "rpkm")
+  n_nobins <- if (is.null(attr(d, "dropped_no_bins"))) 0 else attr(d, "dropped_no_bins")
+  unit     <- if (is.null(attr(d, "unit"))) "FPKM" else attr(d, "unit")
   is_outlier <- rowSums(d[, feats, drop = FALSE]) == 0 & d$rpkm > 1
   n_out <- sum(is_outlier)
   d     <- d[!is_outlier, , drop = FALSE]
@@ -178,7 +205,9 @@ rs_fit <- function(d, label, cfg, progress = function(m) NULL) {
   perf <- data.frame(stage = label, r_test = cor(p_te, te$rpkm),
                      RMSE_test = sqrt(mean((p_te - te$rpkm)^2)),
                      n_train = nrow(tr), n_test = nrow(te),
-                     n_outliers_removed = n_out)
+                     n_outliers_removed = n_out,
+                     n_dropped_no_bins = n_nobins,
+                     n_features = length(feats), n_marks = length(mk))
   
   progress(paste("Single regions:", label))
   single <- do.call(rbind, lapply(seq_along(RS_KEYS), function(i) {
@@ -207,7 +236,7 @@ rs_fit <- function(d, label, cfg, progress = function(m) NULL) {
   pred <- setNames(predict(rf, X), rownames(X))
   y    <- setNames(d[rownames(X), "rpkm"], rownames(X))
   
-  list(stage = label, feats = feats, marks = mk, rf = rf, cv = cv, cor = cor_m,
+  list(stage = label, unit = unit, feats = feats, marks = mk, rf = rf, cv = cv, cor = cor_m, data = d, test_genes = rownames(te),
        perf = perf, single = single, S = S, X = X, y = y, pred = pred,
        base = mean(pred - rowSums(S)))
 }
@@ -233,8 +262,23 @@ rs_summarise <- function(fit) {
 
 # ---- 9. Whole run -------------------------------------------------------------
 # specs: list of list(label, hmm, cond, marks, ct, samples)
+# Genes whose gene BODIES overlap another gene's body. Their region windows
+# sit on the same ChromStaR bins, so the features are not independent.
+# (Flank windows of neighbouring genes overlap all the time and are not used.)
+rs_shared_genes <- function(genes) {
+  ov <- findOverlaps(genes, genes, ignore.strand = TRUE)
+  ov <- ov[genes$gene_id[queryHits(ov)] != genes$gene_id[subjectHits(ov)]]
+  sort(unique(as.character(genes$gene_id[queryHits(ov)])))
+}
+
 rs_run <- function(specs, genes, cfg, progress = function(m) NULL) {
-  regs <- rs_make_regions(genes)
+  shared <- rs_shared_genes(genes)
+  regs   <- rs_make_regions(genes)
+  exclude <- if (is.null(cfg$exclude_shared)) TRUE else isTRUE(cfg$exclude_shared)
+  if (exclude && length(shared) > 0) {
+    genes <- genes[!as.character(genes$gene_id) %in% shared]
+    regs  <- rs_make_regions(genes)
+  }
   fits <- list()
   for (sp in specs) {
     progress(paste("Features:", sp$label))
@@ -258,7 +302,9 @@ rs_run <- function(specs, genes, cfg, progress = function(m) NULL) {
       names(d) <- c("f1", "f2", "rho")
       cbind(stage = s, d)
     })),
-    cfg     = cfg)
+    cfg     = cfg,
+    shared_genes = shared,
+    excluded_shared = exclude)
 }
 
 # ---- Figures ------------------------------------------------------------------
@@ -365,7 +411,7 @@ rs_plot_waterfall <- function(fit, gene, top = 12) {
     geom_vline(xintercept = fit$base, linetype = "dashed", colour = "grey50") +
     geom_vline(xintercept = fit$pred[[gene]], colour = "black") +
     scale_colour_manual(values = c(up = "#d7191c", down = "#2c7bb6"), guide = "none") +
-    labs(x = "Predicted log2(FPKM+1)", y = NULL,
+    labs(x = paste0("Predicted log2(", fit$unit, " + 1)"), y = NULL,
          title = paste(gene, "-", fit$stage),
          subtitle = sprintf("baseline %.2f -> predicted %.2f (measured %.2f)",
                             fit$base, fit$pred[[gene]], fit$y[[gene]])) +
@@ -377,10 +423,13 @@ rs_write_outputs <- function(res, dir) {
   dir.create(dir, showWarnings = FALSE, recursive = TRUE)
   wc <- function(x, f) write.csv(x, file.path(dir, f), row.names = FALSE)
   wc(res$perf,    "performance_combined_model.csv")
-  wc(res$cv,      "cv_5fold_results.csv")
+  wc(res$cv,      paste0("cv_", res$cfg$cv_folds, "fold_results.csv"))
+  if (length(res$shared_genes) > 0)
+    wc(data.frame(gene_id = res$shared_genes), "genes_sharing_bins.csv")
   wc(res$single,  "single_region_performance.csv")
   wc(res$fs,      "shap_feature_summary.csv")
   wc(res$cor_all, "feature_correlations.csv")
+  rs_write_extra(res, dir)
   saveRDS(res$fits, file.path(dir, "rf_shap_fits.rds"))
   ggsave(file.path(dir, "Fig_feature_correlation.pdf"), rs_plot_corr(res$cor_all),
          width = 11, height = 9)
