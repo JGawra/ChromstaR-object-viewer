@@ -2114,6 +2114,7 @@ parse_marks_conditions <- function(hmm) {
 # =============================================================================
 source("rf_shap_tools.R")
 source("rf_shap_extra.R")
+source("volcano_tools.R")
 ui <- dashboardPage(
   skin = "blue",
   
@@ -2152,6 +2153,7 @@ ui <- dashboardPage(
       menuItem("SHAP Mark x Region", tabName = "rs_shap",  icon = icon("chart-bar")),
       menuItem("RF Combined (Rmd)", tabName = "rs_rmd", icon = icon("chart-line")),
       menuItem("SHAP Gene Explorer", tabName = "rs_genes", icon = icon("dna")),
+      menuItem("Volcano Plots", tabName = "volcano", icon = icon("crosshairs")),
       menuItem("Data Table",      tabName = "table",      icon = icon("table")),
       menuItem("About / Help",    tabName = "about",      icon = icon("circle-info"))
     ),
@@ -2986,7 +2988,7 @@ ui <- dashboardPage(
                 )
               )
       ),
-      
+      tabItem(tabName = "volcano", volcano_tab_ui()),
       tabItem(tabName = "table",
               fluidRow(
                 box(title = "Chromatin State Segments", width = 12, status = "primary",
@@ -7679,7 +7681,13 @@ server <- function(input, output, session) {
       zip::zipr(file, list.files(d, full.names = TRUE))
     }
   ) 
-  
+
+  volcano_server(input, output, session, ctx = list(
+    stages      = active_stages,
+    genes       = reactive(rv$genes),
+    stage_conds = stage_conditions_kept,
+    label_a     = stage_a_label,
+    label_b     = stage_b_label))  
 }
 # =============================================================================
 # RUN
